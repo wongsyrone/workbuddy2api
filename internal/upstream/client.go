@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,21 +25,22 @@ import (
 type ErrKind int
 
 const (
-	ErrNone             ErrKind = iota // 成功
-	ErrHardCredit                      // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                        // 429 软限流 → 短冷却
-	ErrSessionDead                     // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                        // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                          // 5xx 上游故障
-	ErrContentBlocked                  // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                       // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
-	ErrAccountFault                    // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                    // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrWafBlock                        // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
-	ErrPromptTooLong                   // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
-	ErrImageInvalid                    // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrClient                          // 其他 4xx / 业务错误
-	ErrToolCallMismatch                // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
+	ErrNone                 ErrKind = iota // 成功
+	ErrHardCredit                          // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                            // 429 软限流 → 短冷却
+	ErrSessionDead                         // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                            // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                              // 5xx 上游故障
+	ErrContentBlocked                      // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                           // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrAccountFault                        // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrModelBlocked                        // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrWafBlock                            // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrPromptTooLong                       // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                        // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrClient                              // 其他 4xx / 业务错误
+	ErrFallbackModelMissing                // A fallback path lacks this model; do not penalize the account.
+	ErrToolCallMismatch                    // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
 )
 
 func (k ErrKind) String() string {
@@ -69,6 +71,8 @@ func (k ErrKind) String() string {
 		return "image_invalid"
 	case ErrToolCallMismatch:
 		return "tool_call_mismatch"
+	case ErrFallbackModelMissing:
+		return "fallback_model_missing"
 	case ErrClient:
 		return "client"
 	default:
@@ -136,6 +140,24 @@ type Error struct {
 
 func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
+}
+
+// codeRe 从上游响应体里抽业务码：数字（11140）与带横线的字符串（11-128）两种形态。
+// 上游偶尔给出**非法 JSON**（`"code":11-128` 没加引号，见 issue #201 的原始响应），
+// 所以这里用正则而不是 json.Unmarshal —— 解析失败的响应也要能报出码来。
+var codeRe = regexp.MustCompile(`"code"\s*:\s*"?([0-9]{2,8}(?:-[0-9]{1,4})?)"?`)
+
+// CodeOf 取上游响应体里的业务码字面值；取不到返回 ""。
+//
+// 存在的理由（issue #201 缺陷 1）：禁用/冷却理由里此前**写死**了 11140，而真实
+// 响应是 HTTP 400 + code 11-128 —— 排障时按 11140 去搜会得到完全错误的方向
+// （"UA 平台段送错"）。理由里带上响应自己的码，才不会把人带偏。
+func CodeOf(body string) string {
+	m := codeRe.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
@@ -223,6 +245,13 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+	// 11-128「conversation id missing」：上游按账号灰度启用的渠道校验（issue #193/#201）。
+	// 出站已补会话头族（session.ConversationIDForHeaders），仍撞上说明该账号被灰度到
+	// 了别的口径 —— **它是账号级的持续性故障**，不是"客户端请求有问题"：同一账号必拦、
+	// 未灰度账号零交叉（#193 的账号维度实测）。此前它落通用 4xx → 只换号不罚号，坏号
+	// 留在池里"显示健康、每次被选中都失败"（#201 缺陷 2）。归到本类由
+	// applyErrorPolicy 按账号级处理（软冷却，不禁用：可能随上游灰度调整自愈）。
+	"conversation id missing",
 }}
 
 // promptTooLongRule 11115「prompt is too long」判定（任务书 prompt-too-long §1）。
@@ -235,7 +264,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 //
 // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
 // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
 // 上游原文可自行排查，代价可控。
 var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
 	`"code":11115`,
@@ -270,7 +299,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -563,6 +592,13 @@ func Classify(status int, body string) ErrKind {
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
+	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
+	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
+	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
+	// "显示健康、每次被选中都失败" —— 与 issue #201 缺陷 2 同型。
+	if IsChannelCheck(body) {
+		return ErrAccountFault
+	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
@@ -677,6 +713,19 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
+	// GzipBody chat 请求体超过 gzipBodyThreshold 时用 gzip 压缩后再发上游
+	// （issue #297）。false 完全还原为不压缩（排障开关）。
+	// 只压 chat：refresh/checkin/billing 的请求体都在几 KB 量级，压了纯耗 CPU。
+	GzipBody bool
+
+	// channelBlocked 记录被渠道校验拦过的账号 → 到期时间（issue #296）。
+	// 命中后该账号后续请求**优先走 /console**（官方客户端路径），不必每次都先
+	// 撞一次 /v2 的 11128 再换路径 —— 既省一次往返，也避免同一账号在一轮对话里
+	// 反复触发风控计数。TTL 后自动回落到 /v2 主路径，防止上游策略变化后永远
+	// 走次优路径。
+	channelBlockedMu sync.Mutex
+	channelBlocked   map[string]time.Time
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
 	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
@@ -739,6 +788,7 @@ func New() *Client {
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: true,
+		GzipBody:             true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 	}
@@ -1038,8 +1088,49 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	return nil
 }
 
-// 路径常量：CN 与 global 共用的 chat 出站路径（/v2 单路径）。
-const chatCompletionsPath = "/v2/chat/completions"
+// chat 出站路径：/v2 为主，/console 作为**兜底**（见 chatPaths）。
+const (
+	chatCompletionsPath = "/v2/chat/completions"
+	chatConsolePath     = "/console/chat/completions"
+)
+
+// IsChannelCheck 判上游的「渠道校验」拒绝（11128 / 11-128 家族，2026-10-17）。
+//
+// 指纹要**两条同时成立**：业务码（11128 或 11-128）**且**文案里出现渠道校验的措辞。
+// 只认码不行 —— 同一个 11-128 还承载「内容审核拦截」（`blocked by security policy`，
+// 见 contentBlockedRule），那种必须保持原行为（不换路径、不罚号、走降级重试）。
+// 文案两种语言都可能出现：中文「渠道校验」与英文 displayTips 的 channel verification
+// / official client；`request illegal` 这类历史 msg 也可能随同一封套出现，所以不能
+// 拿 msg 当判据。
+// IsUpstreamRestriction 判断响应是否是上游的「账号风控限制」（不是凭证失效）。
+//
+// 现场（2026-11-01，CN）：403 + `{"code":11140,"msg":"request illegal"}`，但封套里
+// displayMsg 明确写着「账号存在异常行为，已被限制使用」、displayTips 让用户「提交反馈
+// 申诉」。这类限制是**可申诉、会自行解除**的账号级风控，不是 OAuth 凭证被拒 ——
+// 按永久禁用处理会把还能救回来的号直接踢出池子（现场 6 个号被误标为「需重新登录」）。
+//
+// 只认带「异常行为 / unusual activity」话术的 11140；不带这层话术的
+// `request illegal`（历史上 global 的 auth_forbidden）仍走原有硬禁用策略。
+func IsUpstreamRestriction(body string) bool {
+	if !strings.Contains(body, "11140") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "unusual activity") ||
+		strings.Contains(body, "异常行为") ||
+		strings.Contains(body, "異常行為") ||
+		strings.Contains(lower, "abnormal")
+}
+
+func IsChannelCheck(body string) bool {
+	lower := strings.ToLower(body)
+	if !codeMarker(lower, "11128") && !codeMarker(lower, "11-128") {
+		return false
+	}
+	return strings.Contains(body, "渠道校验") ||
+		strings.Contains(lower, "channel verification") ||
+		strings.Contains(lower, "official client")
+}
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
@@ -1081,13 +1172,31 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
-	for _, path := range c.chatPaths(a) {
+	paths := c.chatPaths(a)
+	// 请求体压缩（issue #297）：>64KB 才压；Compressed 为空表示未压缩。
+	// 这里算一次、循环内复用：路径回落（/v2 → /console）不需要重新压。
+	outBody, contentEncoding := c.outboundBody(prepared)
+	// gzipRetried 防止「压缩版失败 → 未压缩重试」再次进入同一分支。
+	gzipRetried := false
+	// channelRetried 渠道校验命中且已无备用路径时，允许**原样重发一次**
+	// （issue #296：上游报文明确写着「请求被拦截，请重新发送」，说明它期望
+	// 客户端重试；灰度校验有概率性，同一请求重发一次常能通过）。
+	channelRetried := false
+	var primaryChannelRaw []byte
+	var primaryChannelErr *Error
+	for i := 0; i < len(paths); i++ {
+		path := paths[i]
 		url := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(outBody))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if contentEncoding != "" {
+			req.Header.Set("Content-Encoding", contentEncoding)
+			// 上游按 Content-Length 计费/限流时，压缩后的长度必须显式给出：
+			// 用 bytes.Reader 建请求时 Go 会自己算，这里只是说明语义。
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
@@ -1112,11 +1221,95 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", logfmt.Label(a.UID, a.Nickname), rerr)
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
+			// 上游不接受压缩请求体（issue #297 兜底）：改成未压缩重发**同一条路径**。
+			// 只重试一次，且只对 415 / 「解析失败」类 400 生效 —— 其他 4xx 是请求本身
+			// 的问题，重发只是多打一次上游。
+			if contentEncoding != "" && !gzipRetried &&
+				gzipUnsupported(resp.StatusCode, string(raw)) {
+				gzipRetried = true
+				contentEncoding = ""
+				outBody = prepared
+				log.Printf("INFO: [upstream] chat_stream acct=%s: upstream rejected gzip body (%d)，改用未压缩重试",
+					logfmt.Label(a.UID, a.Nickname), resp.StatusCode)
+				i-- // 同一路径再来一次（经典索引循环，range 里改 i 无效）
+				continue
+			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
-			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链；billing 层的
-			// 404 fallback 独立存在，语义不受影响）。
+			// 回退路径上的 11102 降级（issue #245）：能走到 /console 是因为 /v2 判了渠道
+			// 校验，而 /console 本来就可能不提供这个模型 —— 11102 只说明「这条路径没有」，
+			// 不是「该账号缺这个模型」。照 ErrModelBlocked 处理，handler 会写 (账号,模型)
+			// 6 小时负缓存，逐个账号轮过去就是整池 503 no_healthy_account，比不换路径更糟。
+			// 也不按 ErrClient 处理：连败计数是账号健康信号，这里失败的是路径不是账号。
+			if kind == ErrModelBlocked && (i > 0 || path == chatConsolePath) {
+				log.Printf("WARN: [upstream] chat_stream acct=%s: 回退路径 %s 报 %s，按请求级处理（不写模型冷却）",
+					logfmt.Label(a.UID, a.Nickname), path, kind)
+				// 判据按路径而非候选序号（2026-10-28）：撞过渠道校验后 chatPaths 会把 /console
+				// 排到首位，那时 11102 落在 i == 0，旧条件不成立，就被当成「该账号缺这个模型」写
+				// 6 小时负缓存；逐个账号轮过去就是整池 503 no_healthy_account。
+				// /console 报 11102 只说明这条路径没有该模型（或两端模型命名空间不同），
+				// 所以还要换回 /v2 继续试，别把请求直接判死。
+				if path == chatConsolePath && i < len(paths)-1 {
+					log.Printf("WARN: [upstream] chat_stream acct=%s: %s 无此模型，换路径 %s 重试",
+						logfmt.Label(a.UID, a.Nickname), path, paths[i+1])
+					continue
+				}
+				kind = ErrFallbackModelMissing
+				if primaryChannelErr != nil {
+					return nil, primaryChannelErr.Status, primaryChannelRaw, primaryChannelErr
+				}
+			}
+			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
+			//   · 渠道校验（11128/11-128）：/v2 新增强校验，/console 放行（见 chatPaths）；
+			// 触发条件**只有渠道校验**：404/405 不回落是 #119 的刻意取舍（/console 挂
+			// WAF 内容规则，不能因为路径写错就整批改道），契约由
+			// TestGlobalChatNoFallbackOn404 钉着；渠道校验是另一回事 —— /v2 新加强
+			// 校验而 /console 放行，不换就是整池被拦。只在还有候选时继续；两条都
+			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
+			// （见 handler 的 ErrAccountFault 分支）。
+			if IsChannelCheck(string(raw)) {
+				if path == chatCompletionsPath {
+					primaryChannelRaw = raw
+					primaryChannelErr = &Error{Kind: kind, Status: resp.StatusCode, Msg: string(raw)}
+				}
+				// 压缩请求体本身就是一条「不像官方客户端」的信号（issue #303：
+				// DSH 长上下文被 gzip 后稳定吃 11128，同一 body 不压缩即 200）。
+				// 命中渠道校验时**先**去掉压缩重发同一条路径：gzip 只是省带宽的
+				// 优化，不值得为它换来一整轮失败。这一步放在 markChannelBlocked
+				// 之前 —— 去掉压缩后成功就说明账号没问题，不该给它留下「渠道受限」
+				// 记忆（否则后续 10 分钟白走 /console）。
+				if contentEncoding != "" && !gzipRetried {
+					gzipRetried = true
+					contentEncoding = ""
+					outBody = prepared
+					log.Printf("WARN: [upstream] chat_stream acct=%s: 渠道校验命中且请求体是压缩的，改用未压缩重试",
+						logfmt.Label(a.UID, a.Nickname))
+					i--
+					continue
+				}
+				// 记下这个账号被渠道校验拦过：后续请求优先走 /console（issue #296），
+				// 不必每次都先撞一次 /v2。TTL 到期自动回落，上游策略变化后不会卡在
+				// 次优路径上。
+				c.markChannelBlocked(a.UID)
+				if i < len(paths)-1 {
+					log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
+						logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
+					continue
+				}
+				// 备用路径也被拦：按上游报文的要求原样重发一次（仅一次）。
+				// 仍然失败就走下面的错误返回 —— 这条不再重试，避免把 429/风控
+				// 放大成多倍请求。
+				if !channelRetried {
+					channelRetried = true
+					log.Printf("WARN: [upstream] chat_stream acct=%s: 渠道校验在 %s 上仍被拦，原样重发一次",
+						logfmt.Label(a.UID, a.Nickname), path)
+					i--
+					continue
+				}
+			}
+			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
+			// 层的 404 fallback 独立存在，语义不受影响）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
@@ -1136,10 +1329,127 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
-// chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [/v2]（#119 固定单路径，见 ChatStreamContext 头注释）；cn → [/v2]（单元素，现状）。
+// gzipBodyThreshold chat 请求体超过这个大小才压缩（issue #297）。
+//
+// 64KB 的依据：小请求压了只多一次分配与 CPU，省下的带宽可以忽略；而长上下文
+// 请求体在 1MB 以上（实测 4.2 字节/token，78 万 token ≈ 3.3MB），服务器出口
+// 只有 ~1Mbps 时首字节要等 20-30 秒 —— 压到 1/4.5 就是实打实的提速。
+const gzipBodyThreshold = 64 << 10
+
+// channelBlockTTL 渠道校验命中后「优先走 /console」的时长（issue #296）。
+// 10 分钟覆盖一轮长对话；过短会反复撞 /v2，过长则上游策略变化后迟迟不切回。
+const channelBlockTTL = 10 * time.Minute
+
+// outboundBody 按配置决定 chat 请求体是否压缩，返回最终 body 与 Content-Encoding。
+// gzip 失败（理论上只有内存不足）时原样返回未压缩 body，不阻断请求。
+func (c *Client) outboundBody(body []byte) ([]byte, string) {
+	if c == nil || !c.GzipBody || len(body) < gzipBodyThreshold {
+		return body, ""
+	}
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.DefaultCompression)
+	if err != nil {
+		return body, ""
+	}
+	if _, err := zw.Write(body); err != nil {
+		_ = zw.Close()
+		return body, ""
+	}
+	if err := zw.Close(); err != nil {
+		return body, ""
+	}
+	// 压缩后反而更大（已压缩过的二进制内容）→ 不压，省得上游多解一次。
+	if buf.Len() >= len(body) {
+		return body, ""
+	}
+	return buf.Bytes(), "gzip"
+}
+
+// gzipUnsupported 判「上游不接受压缩请求体」的响应（issue #297 的兜底）。
+//
+// 触发面只认两类：HTTP 415（Unsupported Media Type），以及 400 且文案像
+// 「请求体解析失败」。别的 400 一律不重试 —— 那是请求本身的问题，重发只是
+// 多打一次上游。
+func gzipUnsupported(status int, raw string) bool {
+	if status == http.StatusUnsupportedMediaType {
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(raw)
+	for _, marker := range []string{
+		"unmarshal chat params failed", "invalid character", "cannot unmarshal",
+		"unexpected end of json", "invalid json", "failed to decode",
+		"content-encoding", "content encoding", "gzip",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// markChannelBlocked / channelBlockedFor 维护「该账号被渠道校验拦过」的短期记忆。
+func (c *Client) markChannelBlocked(uid string) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.channelBlockedMu.Lock()
+	if c.channelBlocked == nil {
+		c.channelBlocked = make(map[string]time.Time)
+	}
+	// 顺手清过期项，避免 map 随账号数无限增长（账号数量级很小，够用）。
+	now := time.Now()
+	for key, at := range c.channelBlocked {
+		if now.After(at) {
+			delete(c.channelBlocked, key)
+		}
+	}
+	c.channelBlocked[uid] = now.Add(channelBlockTTL)
+	c.channelBlockedMu.Unlock()
+}
+
+func (c *Client) channelBlockedFor(uid string) bool {
+	if c == nil || uid == "" {
+		return false
+	}
+	c.channelBlockedMu.Lock()
+	defer c.channelBlockedMu.Unlock()
+	at, ok := c.channelBlocked[uid]
+	if !ok {
+		return false
+	}
+	if time.Now().After(at) {
+		delete(c.channelBlocked, uid)
+		return false
+	}
+	return true
+}
+
+// chatPaths 返回按 realm 的 chat 路径候选序列：**/v2 优先，/console 兜底**。
+//
+// 兜底是 2026-10-17 加的（用户报告 + 实测）：上游对 /v2/chat/completions 新增了渠道
+// 强校验 —— 被校验到的请求回 11128 / 11-128「没通过渠道校验，可能不是官方客户端发出的」，
+// 而官方客户端走的 /console 端点正常放行；换过去之后连通性测试与对话全部恢复。
+//
+// 与 #119 的关系：那时实测 /console 挂腾讯云 WAF 的 body 内容规则（反引号 printf/whoami
+// 等命令执行特征确定性 403），所以把 /v2 定为主路径 —— 这一点没变：**只有** /v2 被判定为
+// 渠道校验时才换 /console（见 ChatStreamContext 的 fallback 条件），主路径行为零改动。
+// 这也正是 #119 注释里写的「若上游未来关闭 /v2，届时应重新启用 /console」。
 func (c *Client) chatPaths(a *auth.Auth) []string {
-	return []string{chatCompletionsPath}
+	// 被渠道校验拦过的账号：优先走官方客户端路径 /console（issue #296）。
+	// /v2 仍是主路径（#119 的 /console WAF 取舍不变），这里只调整**顺序**：
+	// 上一次撞过 11128 的账号，下一轮不必再白跑一次 /v2。
+	//
+	// 仅对 global 生效：CN 的 /console 不提供 deepseek-v4.1-flash 等模型，提前换过去
+	// 会让该账号之后 10 分钟的**所有**请求都吃 11102（model service info not found）。
+	// 一个账号被 11128 拦一次就把整池打成 503，比原问题更严重；CN 保持 /v2 优先，
+	// 11128 由调用方按请求级处理。
+	if a != nil && a.Realm() != "cn" && c.channelBlockedFor(a.UID) {
+		return []string{chatConsolePath, chatCompletionsPath}
+	}
+	return []string{chatCompletionsPath, chatConsolePath}
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。

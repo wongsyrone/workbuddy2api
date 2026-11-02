@@ -39,6 +39,12 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
+	return p.AvailableUIDsForModelRealmGroups(model, realm, nil)
+}
+
+func (p *Pool) AvailableUIDsForModelRealmGroups(model, realm string, groups []string) []string {
 	return p.availableUIDsLocked(realm,
-		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
+		func(e *entry, now time.Time) bool {
+			return e.a.MatchesGroups(groups) && e.healthyForModel(now, model)
+		})
 }

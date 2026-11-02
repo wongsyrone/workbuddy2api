@@ -176,6 +176,10 @@ type Config struct {
 		// PassthroughIP 是否透传客户端 IP（X-Forwarded-For/X-Real-IP 首段）给上游。
 		// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）；true 才透传。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// GzipBody chat 请求体超过阈值时用 gzip 压缩后再发上游（issue #297）。
+		// 缺省 true：服务器出口带宽窄时（实测 1Mbps）3MB 上下文可省 20s+ 首字节；
+		// 小于阈值（64KB）的请求不压缩，短对话零开销。排障可显式配 false。
+		GzipBody bool `json:"gzip_body"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -202,17 +206,19 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		LargeRequestBytes    int    `json:"large_request_bytes"`
+		LargeRequestCooldown string `json:"large_request_cooldown"`
+		MaxInFlight          int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal    int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold     int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown      string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax   string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
 		// 并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
@@ -236,15 +242,16 @@ type Config struct {
 	} `json:"session_sticky"`
 
 	// 解析后
-	SoftRateDur         time.Duration `json:"-"`
-	SoftRateMaxDur      time.Duration `json:"-"`
-	BreakerCooldownDur  time.Duration `json:"-"`
-	BreakerCooldownMaxD time.Duration `json:"-"`
-	DegradeCooldownDur  time.Duration `json:"-"`
-	DegradeCooldownMaxD time.Duration `json:"-"`
-	SessionTTL          time.Duration `json:"-"`
-	SessionGCInterval   time.Duration `json:"-"`
-	ExpiringSoonDur     time.Duration `json:"-"`
+	SoftRateDur             time.Duration `json:"-"`
+	SoftRateMaxDur          time.Duration `json:"-"`
+	BreakerCooldownDur      time.Duration `json:"-"`
+	BreakerCooldownMaxD     time.Duration `json:"-"`
+	DegradeCooldownDur      time.Duration `json:"-"`
+	DegradeCooldownMaxD     time.Duration `json:"-"`
+	LargeRequestCooldownDur time.Duration `json:"-"`
+	SessionTTL              time.Duration `json:"-"`
+	SessionGCInterval       time.Duration `json:"-"`
+	ExpiringSoonDur         time.Duration `json:"-"`
 	// CreditExhaustedDur 解析后的积分耗尽冷却时长（issue #78）；0 = 不启用
 	// （保持「硬冷却到次日 04:00」的旧行为）。
 	CreditExhaustedDur time.Duration `json:"-"`
@@ -266,6 +273,7 @@ func Default() *Config {
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
 	c.Upstream.TimeoutSeconds = 120
+	c.Upstream.GzipBody = true
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -398,6 +406,11 @@ func applyEnv(c *Config) {
 			c.Upstream.PassthroughIP = b
 		}
 	}
+	if v := os.Getenv("WB2A_GZIP_BODY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.GzipBody = b
+		}
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -514,6 +527,15 @@ func (c *Config) normalize() error {
 	}
 	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
+	if c.Pool.LargeRequestCooldown == "" {
+		c.Pool.LargeRequestCooldown = "90s"
+	}
+	if c.LargeRequestCooldownDur, err = time.ParseDuration(c.Pool.LargeRequestCooldown); err != nil {
+		return fmt.Errorf("pool.large_request_cooldown: %w", err)
+	}
+	if c.Pool.LargeRequestBytes == 0 {
+		c.Pool.LargeRequestBytes = 262144
 	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)

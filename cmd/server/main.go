@@ -220,6 +220,8 @@ func main() {
 	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
 	up.ClientName = cfg.Upstream.ClientName
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 大请求体 gzip（issue #297）：>64KB 才压，短请求零开销。
+	up.GzipBody = cfg.Upstream.GzipBody
 	// global realm 双域路由（config global 段）：base 空回落内置默认 https://www.workbuddy.ai；
 	// GlobalEnabled 与 auth 包开关一致（双保险第二道闸在 upstream.globalOn）。
 	up.ChatBaseGlobal = cfg.Global.ChatBase
@@ -251,7 +253,7 @@ func main() {
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
-		JitterMinutes:      cfg.Schedule.JitterMinutes,
+		JitterMinutes: cfg.Schedule.JitterMinutes,
 		// 实例盐（schedule.jitter_salt，缺省空 = 与引入前逐字一致）。
 		JitterSalt: cfg.Schedule.JitterSalt,
 		// 账号间随机抖动 + 档位小时摊开（schedule.account_delay_* / random_delay_minutes）。
@@ -259,7 +261,7 @@ func main() {
 		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
 		RandomDelayMinutes:     cfg.Schedule.RandomDelayMinutes,
 		RandomDelaySeed:        scheduleSeed,
-		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		ExpiringSoonWindow:     cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
 		// 重试默认关闭（RetryDelayMinutes=0），台账恒在（纯内存，除非给了落盘路径）。
 		LedgerFile:        cfg.Schedule.LedgerFile,
@@ -354,16 +356,18 @@ func main() {
 	}
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		AuthKeys:     buildAuthKeys(cfg),
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:                 p,
+		Upstream:             up,
+		APIKey:               cfg.APIKey,
+		AuthKeys:             buildAuthKeys(cfg),
+		Session:              sessRouter,
+		StickyCount:          sessCount,
+		RedisMode:            redisMode,
+		SoftCooldown:         cfg.SoftRateDur,
+		LargeRequestBytes:    cfg.Pool.LargeRequestBytes,
+		LargeRequestCooldown: cfg.LargeRequestCooldownDur,
+		PromptMode:           cfg.Prompt.Mode,
+		PromptText:           cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。

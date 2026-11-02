@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
 	}{
 		{403, "", true},
 		{403, "<html>blocked</html>", true},
-		{403, `{"code":1}`, false},               // 有 "code": 字段
+		{403, `{"code":1}`, false},                // 有 "code": 字段
 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
 		{402, "", false},                          // 非 403
 		{429, "", false},
@@ -1038,5 +1038,31 @@ func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
 	want := before + 5184000
 	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
 		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
+}
+
+// issue #296 后续：/console 优先只能用于 global。
+//
+// CN 的 /console 不提供 deepseek-v4.1-flash 等模型，账号一旦在 /v2 撞过 11128，
+// 提前换到 /console 会让它之后 10 分钟的每个请求都吃 11102，一个号被拦一次就能
+// 把整池打成 503。
+func TestChatPathsConsoleFirstOnlyForGlobal(t *testing.T) {
+	c := &Client{}
+	cn := &auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"}
+	global := &auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}
+
+	c.markChannelBlocked(cn.UID)
+	if got := c.chatPaths(cn); len(got) != 2 || got[0] != chatCompletionsPath {
+		t.Fatalf("CN 账号撞过渠道校验后仍应 /v2 优先，got %v", got)
+	}
+
+	c.markChannelBlocked(global.UID)
+	if got := c.chatPaths(global); len(got) != 2 || got[0] != chatConsolePath {
+		t.Fatalf("global 账号撞过渠道校验后应 /console 优先（issue #296），got %v", got)
+	}
+
+	fresh := &auth.Auth{UID: "new1", Domain: "www.workbuddy.ai"}
+	if got := c.chatPaths(fresh); got[0] != chatCompletionsPath {
+		t.Fatalf("未撞过渠道校验的账号应 /v2 优先，got %v", got)
 	}
 }

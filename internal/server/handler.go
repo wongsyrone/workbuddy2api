@@ -44,8 +44,10 @@ type Config struct {
 	//
 	// 鉴权时**遍历全表且不在命中处短路**（见 matchAuthKey）：多密钥下"命中即 break"
 	// 会让总耗时随匹配位置变化，等于把"某密钥是否存在、排第几"透给探测者。
-	AuthKeys  []AuthKey
-	MaxRotate int // 单请求最多换号次数，默认 3
+	AuthKeys             []AuthKey
+	LargeRequestBytes    int
+	LargeRequestCooldown time.Duration
+	MaxRotate            int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -168,6 +170,11 @@ const notFoundCooldown = 60 * time.Second
 // 抖动复用 backoff.go jitterDur（单一来源，不重复造轮子）。
 const wafCooldownBase = 60 * time.Second
 
+// upstreamRestrictionCooldown 上游「账号异常行为」风控限制的软冷却时长。
+// 这类限制可申诉、会自行解除（现场观测同一账号数小时后恢复 200），
+// 而凭证本身有效 —— 因此只把它移出轮换，不 Disable、不清凭证。
+const upstreamRestrictionCooldown = 45 * time.Minute
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -185,7 +192,9 @@ type Handler struct {
 	degrade degradeGate
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP wafIPGate
+	wafIP     wafIPGate
+	largeMu   sync.Mutex
+	largeUsed map[string]time.Time
 	// taskMu/taskRunning 手动任务触发的防重入闸（admin_tasks.go）：任务名 →
 	// 是否已有一次手动触发在跑。只挡「手动 vs 手动」连点；「手动 vs 定时」撞车
 	// 由 scheduler 自己的 checkinMu 兜。进程内状态、重启清零——重启后没有在跑的
@@ -204,12 +213,55 @@ type Handler struct {
 }
 
 // NewHandler 构建 handler。
+// largeExclusions 返回「LargeRequestCooldown 窗口内已承接过大请求」的号集合，
+// 顺手清掉过期项。窗口内这些号不再参与大请求选号 —— 这就是逐请求轮换。
+func (h *Handler) largeExclusions(now time.Time) map[string]bool {
+	if h.cfg.LargeRequestBytes <= 0 {
+		return nil // 策略关闭：不排除任何号
+	}
+	h.largeMu.Lock()
+	defer h.largeMu.Unlock()
+	if len(h.largeUsed) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(h.largeUsed))
+	for uid, at := range h.largeUsed {
+		if now.Sub(at) < h.cfg.LargeRequestCooldown {
+			out[uid] = true
+			continue
+		}
+		delete(h.largeUsed, uid)
+	}
+	return out
+}
+
+// noteLargeUse 登记某号刚承接了一次大请求（无论成败，避免紧接着再压给它）。
+func (h *Handler) noteLargeUse(uid string, now time.Time) {
+	if uid == "" {
+		return
+	}
+	h.largeMu.Lock()
+	if h.largeUsed == nil {
+		h.largeUsed = make(map[string]time.Time)
+	}
+	h.largeUsed[uid] = now
+	h.largeMu.Unlock()
+}
+
+// NewHandler 构建 handler。
+
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
+	}
+	if cfg.LargeRequestBytes == 0 {
+		cfg.LargeRequestBytes = 256 << 10
+	}
+	if cfg.LargeRequestCooldown <= 0 {
+		cfg.LargeRequestCooldown = 90 * time.Second
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -263,6 +315,8 @@ func NewHandler(cfg Config) *Handler {
 			h.withAuth(withOps(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable))))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive",
 			h.withAuth(withOps(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive))))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/models/{model}/available",
+			h.withAuth(withOps(h.audit("account.model.available", auditPathValue("uid"), h.adminModelAvailable))))
 		// 立即续期（P0-1）：对单个账号显式跑一次 token 续期，用来区分
 		// 「凭证真死了」与「账号被禁用后保活跳过了它，所以过期状态永远不消失」
 		// （RunKeepaliveNow 首句 `if st.Disabled { continue }`）。有了它，
@@ -862,6 +916,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// 11128 请求级抢救：把 system 文本搬进首条 user 只做一次（搬两次没有意义，
+	// 第二次仍被拦说明触发词在 user 侧或请求其它部分）。
+	systemMoved := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
@@ -899,6 +956,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
 	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+	//   - conversationID：客户端给了就透传原值；**没给时派生一个同会话稳定的值**
+	//     （issue #193：上游对部分账号灰度启用渠道校验，缺 X-Conversation-ID 即判
+	//     11-128「conversation id missing」，被灰度到的账号每次被选中都失败）。
+	//     派生锚点见 session.ConversationIDForHeaders 的注释；只补**头**、不往 body
+	//     里塞 conversationId —— #193 的剥离实测证明校验对象是头，body 那个字段不是
+	//     必填项。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
@@ -922,7 +985,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只写 ConversationHeaderID 而不覆盖 ConversationID：后者仍是 prompt_cache_key
 	// 会话段的哈希源，保持无会话键客户端的「每账号恒键」前缀缓存命中率不被打碎。
 	if chatMeta.ConversationID == "" {
-		chatMeta.ConversationHeaderID = chatMeta.ConversationRequestID
+		chatMeta.ConversationHeaderID = session.ConversationIDForHeaders(body, sessKey)
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
@@ -935,6 +998,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		keyGroups = ki.Groups
 	}
 
+	largeCtx := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes
+	if largeCtx {
+		unbindSticky()
+	}
+	modelBlocksCleared := false
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -950,9 +1018,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知 + 分组感知选号：模型非空时启用 6004 模型级冷却
 			// 豁免（healthyForModel），realm 谓词过滤跨域账号，groups 谓词过滤跨组账号。
-			acct = h.cfg.Pool.PickExcludingForRealmGroups(tried, bareModel, realm, keyGroups)
+			pickTried := tried
+			if largeCtx {
+				if extra := h.largeExclusions(time.Now()); len(extra) > 0 {
+					pickTried = make(map[string]bool, len(tried)+len(extra))
+					for k, v := range tried {
+						pickTried[k] = v
+					}
+					for k := range extra {
+						pickTried[k] = true
+					}
+				}
+			}
+			acct = h.cfg.Pool.PickExcludingForRealmGroups(pickTried, bareModel, realm, keyGroups)
+			if acct == nil && largeCtx {
+				// 所有号都在大请求窗口内：退化普通轮换，避免直接 503。
+				acct = h.cfg.Pool.PickExcludingForRealmGroups(tried, bareModel, realm, keyGroups)
+			}
+			if acct != nil && largeCtx {
+				h.noteLargeUse(acct.UID, time.Now())
+			}
 		}
 		if acct == nil {
+			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModelRealmGroups(bareModel, realm, keyGroups)) == 0 {
+				modelBlocksCleared = true
+				if n := h.cfg.Pool.ClearModelBlocksForRealmGroups(bareModel, realm, keyGroups); n > 0 {
+					tried = map[string]bool{}
+					log.Printf("WARN: [server] model=%s: cleared %d transient model blocks", bareModel, n)
+					i--
+					continue
+				}
+			}
 			st.status = http.StatusServiceUnavailable
 			break
 		}
@@ -1042,6 +1138,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			// 渠道校验是本次请求被拒，不能据此给整个账号写冷却。先做一次
+			// 请求级抢救（system 文本搬进首条 user），仍被拦就透传原始拒绝并
+			// 停止换号，避免同一报文连坐整个账号池。
+			if upstream.IsChannelCheck(string(respBody)) {
+				if kind == upstream.ErrAccountFault && !systemMoved &&
+					(h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") {
+					if moved, ok := prompt.MoveSystemToUser(body); ok {
+						body = moved
+						systemMoved = true
+						// 单账号池也能拿到重试机会（重试占一次轮换名额，与原账号解绑）。
+						delete(tried, acct.UID)
+						releaseHeld()
+						log.Printf("WARN: [server] channel-check (system content) -> moved system into user, retry")
+						continue
+					}
+				}
+				fail(acct.UID)
+				st.status = status
+				writeOpenAIErrorHint(w, status, "channel_check_rejected", string(respBody),
+					"upstream channel verification rejected this request; account availability is unchanged")
+				return
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
@@ -1134,7 +1252,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if stickyKey != "" && h.cfg.Session != nil {
+		if stickyKey != "" && h.cfg.Session != nil && !largeCtx {
 			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {
@@ -1310,6 +1428,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
+//   - ErrFallbackModelMissing → 回退路径上的 11102（issue #245）：零动作（不冷却/不熔断/
+//     不 NoteError），仍然轮转 —— 失败的是路径不是账号，写成模型级冷却会把整池打穿。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
 //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
 //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
@@ -1321,6 +1441,25 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
+// upstreamCodeLabel 给「禁用/冷却理由」用的短标签：优先取响应体里的**真实业务码**
+// （数字，或 11-128 这种带横线的字符串），取不到再回落到 HTTP 状态。
+//
+// 不写死具体码是刻意的（issue #201 缺陷 1）：这条分支历史上只见过 11140，于是理由
+// 里写死了它；现场实际是 `http 400 + code 11-128`，排障的人拿着 11140 去搜方向全错
+// （11140 指向"UA 平台段送错"，而真实原因是渠道校验）。
+func upstreamCodeLabel(body string, uerr *upstream.Error) string {
+	if code := upstream.CodeOf(body); code != "" {
+		if uerr != nil && uerr.Status > 0 {
+			return fmt.Sprintf("code %s, http %d", code, uerr.Status)
+		}
+		return "code " + code
+	}
+	if uerr != nil && uerr.Status > 0 {
+		return fmt.Sprintf("http %d", uerr.Status)
+	}
+	return "unknown code"
+}
+
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
 	switch kind {
 	case upstream.ErrHardCredit:
@@ -1371,16 +1510,52 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
-		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
+		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultRule 一致）：
+		//   - "request illegal"（本机实测是 11-128；历史注释里的 11140 是 403 平台段
+		//     错误场景）→ 账号级**授权封禁**：软冷却到期也不会自动恢复（需重新 OAuth
+		//     登录），到期后重新选号只会再撞一次同样的答复、白费一次轮换——硬禁用
+		//     （Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
+		//   - "conversation id missing"（同为 11-128）→ 上游**按账号灰度**启用的渠道
+		//     校验（issue #193）。出站已补会话头族（session.ConversationIDForHeaders），
+		//     仍撞上说明该账号被灰度到了别的口径：按账号级**软冷却**处理 —— 只换号不
+		//     禁用（灰度随时可能放开，禁用会让用户白重新登录），但必须把它暂时挪出池子，
+		//     否则它留在池里"显示健康、每次被选中都失败"（issue #201 缺陷 2）。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
-		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
+		// 三条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+		lowerBody := strings.ToLower(body)
+		// **渠道校验必须判在「request illegal」之前**（用户报告 2026-10-17）：同一次
+		// 渠道校验会随封套给出不同的 msg（`request illegal` / `conversation id missing`
+		// / 中文「没通过渠道校验」），而按 msg 分野时 `request illegal` 那条会**硬禁用**
+		// 账号 —— 于是被校验到的号在面板上显示「已禁用（需重新登录）」，用户以为凭证
+		// 坏了去重扫，扫完还是被禁（凭证从来没问题）。账号本身是好的，禁用是误判。
+		// 上游层已先做过换路径兜底（/v2 → /console，见 upstream.chatPaths）；两条都被
+		// 拒才走到这里：软冷却让它退出轮换（别被反复选中），但**不清凭证、不标禁用**。
+		if upstream.IsChannelCheck(body) {
+			// chatCompletions 已直接透传；防御调用同样不罚账号。
+			return
+		}
+		if upstream.IsUpstreamRestriction(body) {
+			// 11140 + 「账号存在异常行为，已被限制使用」→ 账号级风控限制（可申诉）。
+			// 与「request illegal / auth_forbidden」不同：限制会解除，凭证没坏 ——
+			// 软冷却期间退出轮换即可，48 分钟后再试，不要永久禁用。
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, upstreamRestrictionCooldown,
+				"upstream restriction ("+upstreamCodeLabel(body, uerr)+", appealable)")
+			return
+		}
+		if strings.Contains(lowerBody, "request illegal") {
+			// 理由里带**响应自己的码**（issue #201 缺陷 1：此前写死 11140，而真实响应
+			// 是 http 400 + code 11-128 —— 按 11140 去搜会把排障方向带偏）。
+			h.cfg.Pool.Disable(uid, fmt.Sprintf(
+				"account banned by upstream (request illegal, %s), re-login required",
+				upstreamCodeLabel(body, uerr),
+			))
+			return
+		}
+		if strings.Contains(lowerBody, "conversation id missing") {
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown,
+				"channel check (conversation id missing, "+upstreamCodeLabel(body, uerr)+")")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
@@ -1404,6 +1579,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+	case upstream.ErrFallbackModelMissing:
+		// 回退路径（/console）报的 11102（issue #245）：只说明「这条路径没有这个模型」，
+		// 不是「该账号缺这个模型」。零动作（不冷却/不熔断/不 NoteError），仍然轮转 ——
+		// 换个号可能压根不需要回退（渠道校验与账号灰度有关），而写成模型级冷却会让
+		// 十几个号轮一圈就把整池打满，对外变成 503 no_healthy_account。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
