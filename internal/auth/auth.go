@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,7 +62,47 @@ type Auth struct {
 	// *Auth 指针，而不是改这个字段），故不纳入 a.mu 保护 —— 与 realm 不同
 	// （realm 会被 RefreshToken 在锁内改写）。
 	Groups []string
+	Weight float64
 }
+
+// 手写权重的取值区间：低于 MinWeight 等于「几乎不用」（但仍留一丝机会，与
+// pickWeighted 的权重保底 ≥1 同口径），高于 MaxWeight 没有实际意义。
+const (
+	MinWeight = 0.1
+	MaxWeight = 100.0
+)
+
+// PickWeight 返回用于选号的权重乘数：未设置（0）或非法值给 1，合法值钳制在
+// [MinWeight, MaxWeight]。选号侧只读本方法、不直读字段 —— 钳制口径只有一处，
+// 否则「文件里写了 1e9」这种输入会把选号直接压成一号独大。
+func (a *Auth) PickWeight() float64 {
+	w := a.Weight
+	if math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 {
+		return 1
+	}
+	if w < MinWeight {
+		return MinWeight
+	}
+	if w > MaxWeight {
+		return MaxWeight
+	}
+	return w
+}
+
+// sanitizeWeight 解析期清洗：非有限值与负数一律当「未设置」（0）。合法但越界的
+// 值**保留原样**，由 PickWeight 在选号时钳制 —— 面板靠原值回显「用户填了什么」，
+// 这里改写会让界面显示与文件内容不一致。手改坏的值打一行 WARN，否则「权重没生效」
+// 会变成没有线索的悬案。
+func sanitizeWeight(w float64) float64 {
+	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+		log.Printf("WARN: [auth] 忽略非法的 weight=%v（按未设置处理，应为 %v..%v）",
+			w, MinWeight, MaxWeight)
+		return 0
+	}
+	return w
+}
+
+// Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
@@ -350,6 +391,7 @@ func Parse(raw []byte) (*Auth, error) {
 			// Groups 顶层 groups（嵌套形与扁平形共用）：账号业务分组标签。
 			Groups []string `json:"groups"`
 			Proxy  string   `json:"proxy"`
+			Weight float64  `json:"weight"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -365,6 +407,7 @@ func Parse(raw []byte) (*Auth, error) {
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
 			ProxyName:    strings.TrimSpace(n.Proxy),
+			Weight:       sanitizeWeight(n.Weight),
 			Groups:       normalizeGroups(n.Groups),
 		}
 	} else {
@@ -380,6 +423,7 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken  string   `json:"device_token"`
 			Groups       []string `json:"groups"`
 			Proxy        string   `json:"proxy"`
+			Weight       float64  `json:"weight"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -395,6 +439,7 @@ func Parse(raw []byte) (*Auth, error) {
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
 			ProxyName:    strings.TrimSpace(f.Proxy),
+			Weight:       sanitizeWeight(f.Weight),
 			Groups:       normalizeGroups(f.Groups),
 		}
 	}
@@ -446,6 +491,9 @@ func (a *Auth) SaveAtomic() error {
 	}
 	if len(a.Groups) > 0 {
 		doc["groups"] = a.Groups
+	}
+	if a.Weight != 0 {
+		doc["weight"] = a.Weight
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
