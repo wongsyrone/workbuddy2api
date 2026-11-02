@@ -317,6 +317,12 @@ func NewHandler(cfg Config) *Handler {
 			h.withAuth(withOps(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive))))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/models/{model}/available",
 			h.withAuth(withOps(h.audit("account.model.available", auditPathValue("uid"), h.adminModelAvailable))))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk",
+			h.withAuth(withOps(h.audit("account.refresh-risk", auditPathValue("uid"), h.adminRefreshRisk))))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk/clear",
+			h.withAuth(withOps(h.audit("account.refresh-risk.clear", auditPathValue("uid"), h.adminClearRefreshRisk))))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk/success",
+			h.withAuth(withOps(h.audit("account.refresh-risk.success", auditPathValue("uid"), h.adminRefreshRiskSuccess))))
 		// 立即续期（P0-1）：对单个账号显式跑一次 token 续期，用来区分
 		// 「凭证真死了」与「账号被禁用后保活跳过了它，所以过期状态永远不消失」
 		// （RunKeepaliveNow 首句 `if st.Disabled { continue }`）。有了它，
@@ -1555,6 +1561,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrAuthRejected:
+		// 纯 401（无 12153、无业务信封）：凭证被上游拒绝，但单次可能是网关抖动
+		// 或 token 轮换竞态 —— 不直接 Disable（chat 路径误判一次就是永久杀号），
+		// 改走连续计数，达到 sessionDeadThreshold 才禁用。计数器与 12153 共用：
+		// 同一账号先后撞到两种形态，本来就说明凭证不会自己好转。
+		h.cfg.Pool.NoteAuthFailure(uid, "401 auth rejected")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

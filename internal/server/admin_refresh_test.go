@@ -107,6 +107,9 @@ func TestAdminOpsRejectsGroupKey(t *testing.T) {
 		{"enable", "/admin/accounts/u1/enable"},
 		{"revive", "/admin/accounts/u1/revive"},
 		{"model available", "/admin/accounts/u1/models/glm-5.2/available"},
+		{"refresh risk", "/admin/accounts/u1/refresh-risk"},
+		{"refresh risk clear", "/admin/accounts/u1/refresh-risk/clear"},
+		{"refresh risk success", "/admin/accounts/u1/refresh-risk/success"},
 		{"refresh", "/admin/accounts/u1/refresh"},
 		{"task run", "/admin/tasks/keepalive/run"},
 	}

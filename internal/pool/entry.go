@@ -32,8 +32,9 @@ const degradeReason = "consecutive failures"
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID   string `json:"uid"`
-	Realm string `json:"realm,omitempty"`
+	RefreshRisk *RefreshRiskStatus `json:"refresh_risk,omitempty"`
+	UID         string             `json:"uid"`
+	Realm       string             `json:"realm,omitempty"`
 	// Groups 账号的**业务分组标签**（分组密钥功能）。运维据此在 /status 一眼确认
 	// "这个号落在哪几把密钥的可见范围内"，不必去翻 auth 文件。
 	// 未打标签时 omitempty 不输出（与 realm 同处理：空值不占版面，也不让人误读）。
@@ -144,8 +145,9 @@ type ModelCostStatus struct {
 }
 
 type entry struct {
-	a       *auth.Auth
-	credits int64
+	refreshRisk *RefreshRiskState
+	a           *auth.Auth
+	credits     int64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -263,7 +265,7 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled || e.manualDisabled {
+	if e.disabled || e.manualDisabled || e.refreshRiskActive(now) {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -288,7 +290,7 @@ func (e *entry) healthy(now time.Time) bool {
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero()
+		!e.disabled && !e.manualDisabled && !e.refreshRiskActive(time.Now()) && e.breakerUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -403,9 +405,10 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits  int64  `json:"credits"`
-	Disabled bool   `json:"disabled"`
-	Reason   string `json:"reason,omitempty"`
+	RefreshRisk *RefreshRiskState `json:"refresh_risk,omitempty"`
+	Credits     int64             `json:"credits"`
+	Disabled    bool              `json:"disabled"`
+	Reason      string            `json:"reason,omitempty"`
 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，
 	// 这也正是该功能要解决的痛点之一（旧权宜做法改 state.json 会被 5s flush 覆盖，
 	// 入口化后无需再碰文件）。零值也显式写出（运维口径，同 err_total 注释）。

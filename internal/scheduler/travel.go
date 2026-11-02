@@ -93,7 +93,7 @@ func (s *Scheduler) runTravel(ctx context.Context, trigger string) {
 
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
 			t.skipped++
 			continue
 		}

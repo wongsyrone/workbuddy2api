@@ -42,6 +42,7 @@ const (
 	ErrFallbackModelMissing                // A fallback path lacks this model; do not penalize the account.
 	ErrEmptyMessage                        // Request content is invalid; do not rotate accounts.
 	ErrToolCallMismatch                    // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
+	ErrAuthRejected                        // Repeated HTTP 401 responses without a session-dead code.
 )
 
 func (k ErrKind) String() string {
@@ -78,6 +79,8 @@ func (k ErrKind) String() string {
 		return "empty_message"
 	case ErrClient:
 		return "client"
+	case ErrAuthRejected:
+		return "auth_rejected"
 	default:
 		return "none"
 	}
@@ -604,6 +607,13 @@ func Classify(status int, body string) ErrKind {
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
+	// 401 兜底（**无 12153** 的纯 401）：上游网关拦截页、空体、纯 HTML 都落到
+	// 这里。单列 ErrAuthRejected 而不是 ErrClient —— 见该 errkind 的注释：
+	// ErrClient 只换号不罚号，坏号会在池里反复被选中；而这一类的正确处置是
+	// 「连续 N 次后禁用」（handler.applyErrorPolicy 走 NoteAuthFailure）。
+	if status == http.StatusUnauthorized {
+		return ErrAuthRejected
+	}
 	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
 	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
 	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
@@ -701,7 +711,10 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
-	HTTP *http.Client
+	RefreshPaused      func(uid string) bool
+	OnRefreshRateLimit func(uid string, retryAfter time.Duration)
+	OnRefreshSuccess   func(uid string)
+	HTTP               *http.Client
 
 	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
@@ -1033,7 +1046,11 @@ func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		retryAfter := time.Duration(0)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = refreshRetryAfter(resp.Header, raw)
+		}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1068,7 +1085,15 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
 //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
-func (c *Client) RefreshToken(a *auth.Auth) error {
+func (c *Client) RefreshToken(a *auth.Auth) (err error) {
+	if c.RefreshPaused != nil && c.RefreshPaused(a.UID) {
+		return &Error{Kind: ErrSoftRate, Status: http.StatusTooManyRequests, Msg: "token refresh safety pause active"}
+	}
+	defer func() {
+		if err == nil && c.OnRefreshSuccess != nil {
+			c.OnRefreshSuccess(a.UID)
+		}
+	}()
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -1105,6 +1130,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 网络 I/O（锁外，30s 上限）。
 	data, err := c.doJSON(&hdrSnapshot, req)
 	if err != nil {
+		var upstreamErr *Error
+		if errors.As(err, &upstreamErr) && upstreamErr.Status == 429 && c.OnRefreshRateLimit != nil {
+			c.OnRefreshRateLimit(a.UID, upstreamErr.RetryAfter)
+		}
 		return err
 	}
 	var tok struct {

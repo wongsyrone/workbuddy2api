@@ -595,7 +595,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 	}
 	for _, st := range statuses {
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
-		if st.Disabled {
+		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
 			oc.Status, oc.Detail = CheckinSkipped, "disabled"
 			skipN++
 			out = append(out, oc)
@@ -772,7 +772,7 @@ func (s *Scheduler) runActivity(ctx context.Context, trigger string) {
 	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
 			t.skipped++
 			continue
 		}
@@ -1029,7 +1029,7 @@ func (s *Scheduler) runKeepaliveContext(ctx context.Context, trigger string) {
 	started := time.Now()
 	var t runTally
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
 			t.skipped++
 			continue
 		}

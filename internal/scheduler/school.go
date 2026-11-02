@@ -121,6 +121,15 @@ func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands 
 }
 
 func (s *Scheduler) runScriptTaskContext(ctx context.Context, kind taskKind, trigger, name string, commands [][]string) {
+	if s.cfg.Pool != nil {
+		for _, account := range s.cfg.Pool.List() {
+			if s.cfg.Pool.RiskPaused(account.UID) {
+				log.Printf("scheduled %s skipped: token refresh safety pause", name)
+				s.recordRun(kind, trigger, time.Now(), runTally{total: 1, skipped: 1, note: "token refresh safety pause"})
+				return
+			}
+		}
+	}
 	for i := range commands {
 		commands[i] = s.accountScriptArgs(ctx, commands[i])
 	}
