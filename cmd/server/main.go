@@ -166,6 +166,7 @@ func main() {
 	// 积分耗尽后的冷却时长（cooldown.credit_exhausted，issue #78）：0 = 保持
 	// 「硬冷却到次日 04:00」旧行为；配了就只退出这一小段再回候选池。
 	p.SetCreditExhausted(cfg.CreditExhaustedDur)
+	upstream.ConfigureReasoningFallback(cfg.ReasoningAsContent == nil || *cfg.ReasoningAsContent)
 	upstream.ConfigureProxies(cfg.Proxies)
 	if names := upstream.RouteNames(); len(names) > 0 {
 		log.Printf("出口线路已加载：%s", strings.Join(names, ", "))

@@ -24,6 +24,17 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// errTruncatedStream 上游流「中途断掉」：转发过有效帧，但既没有 finish_reason
+// 也没有 data: [DONE] 就 EOF（服务端流超时、限流后直接关 TCP 等）。
+// 与 errEmptyStream 分开：那是「一帧都没有」，这是「有内容但没正常收尾」——
+// 两种上游缺陷在日志里应能区分。
+var errTruncatedStream = errors.New("upstream stream ended before completion")
+
+// IsTruncatedStreamError 报告错误是否为「上游截断」——供 handler 在流式路径把
+// 截断记为失败观测（HTTP 头已发出只能 200，但日志/状态不应留下成功）。
+// 告知客户端的义务由 StreamHint 在 [DONE] 之前插入的 error 帧承担。
+func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -218,9 +229,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if created == 0 {
 		created = float64(time.Now().Unix())
 	}
+	// reasoningBackfill（issue #135）：整轮没有正文、也没有工具调用时，把思考
+	// 原文当正文下发 —— 只看 content 的客户端否则会看到空回复。正常轮次零改动。
+	bodyText := content.String()
+	if ReasoningFallbackEnabled() && bodyText == "" && len(toolOrder) == 0 && reasoning.Len() > 0 {
+		bodyText = reasoning.String()
+	}
 	message := map[string]any{
 		"role":    role,
-		"content": content.String(),
+		"content": bodyText,
 	}
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
@@ -489,6 +506,39 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
 
+	// reasoningBackfill 的整轮状态（issue #135）：是否出现过正文 / 工具调用，
+	// 以及思考通道累积的原文。收尾时若两者都没有而思考有内容，补发一帧正文。
+	// 只在开关打开时维护（关掉时零开销、与旧行为逐字节一致）。
+	sawContent := false
+	sawToolCalls := false
+	var reasoningBuf strings.Builder
+
+	// 收尾帧缓冲（issue #135 的帧序修正）：一旦出现 finish_reason，后续帧先存着，
+	// 循环结束后按「补发正文 → 原收尾帧 → [DONE]」发出。
+	//
+	// 为什么必须重排：直接转发的话，补发的 content 排在 finish_reason **之后** ——
+	// 很多 OpenAI 兼容客户端看到 finish_reason 就停止累积/渲染，那一帧等于没发，
+	// 「只看正文的客户端不再空回复」这个修复对它们完全无效。
+	var tailBuf []string
+	tailing := false
+	// 收尾判据（**独立于 ReasoningFallback 开关**，关掉时也要生效）：
+	// 上游是否显式发过 data: [DONE]、是否出现过带 finish_reason 的帧。
+	// 两者皆无而流已结束 = 中途断掉，不是「模型说完了」。
+	sawDone := false
+	sawFinish := false
+	flushTail := func() error {
+		for _, p := range tailBuf {
+			if _, err := io.WriteString(w, "data: "+p+"\n\n"); err != nil {
+				return err
+			}
+		}
+		if len(tailBuf) > 0 && fl != nil {
+			fl.Flush()
+		}
+		tailBuf = nil
+		return nil
+	}
+
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
@@ -523,10 +573,39 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 			if _, hasErr := obj["error"]; hasErr {
+				// 已进入收尾段：先把缓冲的收尾帧发出去，再发错误帧，避免顺序反转。
+				if werr := flushTail(); werr != nil {
+					return 0, werr
+				}
 				if werr := writeRaw(payload); werr != nil {
 					return 0, werr
 				}
 				return 1, nil
+			}
+			// reasoningBackfill：记录整轮是否出现正文/工具调用，并累积思考原文。
+			// 放在错误帧早退之后 —— 上游错误帧不属于正常内容，不该参与判定。
+			if ReasoningFallbackEnabled() {
+				if chs, ok := obj["choices"].([]any); ok {
+					for _, ci := range chs {
+						c, _ := ci.(map[string]any)
+						if c == nil {
+							continue
+						}
+						d, _ := c["delta"].(map[string]any)
+						if d == nil {
+							continue
+						}
+						if v, ok := d["content"].(string); ok && v != "" {
+							sawContent = true
+						}
+						if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+							sawToolCalls = true
+						}
+						if v, ok := d["reasoning_content"].(string); ok && v != "" {
+							reasoningBuf.WriteString(v)
+						}
+					}
+				}
 			}
 			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 			stripToolCallNames(obj, toolCallSeen)
@@ -545,6 +624,17 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 				payload = string(raw)
 			}
 			valid = 1
+			// 收尾观测：出现过 finish_reason 即算上游正常收了尾（与开关无关）。
+			if frameHasFinish(obj) {
+				sawFinish = true
+			}
+			// 帧序修正：出现 finish_reason 后（含本条）先缓冲，等补发正文后再发。
+			// 开关关闭时整段不执行 —— 与改造前逐字节一致。
+			if ReasoningFallbackEnabled() && (tailing || frameHasFinish(obj)) {
+				tailing = true
+				tailBuf = append(tailBuf, payload)
+				return valid, nil
+			}
 		}
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return 0, werr
@@ -565,6 +655,7 @@ readLoop:
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
+			sawDone = true
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
@@ -594,9 +685,62 @@ readLoop:
 	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
 	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
 	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+		_ = writeRaw(`{"error":{"message":"upstream stream ended before completion (empty upstream stream)","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
+	// reasoningBackfill：整轮无正文、无工具调用，但思考通道有内容 —— 补发一帧
+	// 正文，让只看 content 的客户端拿到输出，而不是判成「模型没有输出」。
+	// 放在 [DONE] 之前，客户端仍按正常流收尾；开关关闭时这段不执行。
+	if ReasoningFallbackEnabled() && !sawContent && !sawToolCalls && reasoningBuf.Len() > 0 {
+		rid := firstID
+		if rid == "" {
+			rid = "chatcmpl-wb2api"
+		}
+		chunk := map[string]any{
+			"id":      rid,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"choices": []any{map[string]any{
+				"index":         0,
+				"delta":         map[string]any{"content": reasoningBuf.String()},
+				"finish_reason": nil,
+			}},
+		}
+		if raw, merr := json.Marshal(chunk); merr == nil {
+			if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
+				return werr
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}
+	// 收尾帧（含 finish_reason 与之后的 usage 帧）：补发正文之后才发，
+	// 客户端才会把正文算进这一轮。
+	if err := flushTail(); err != nil {
+		return err
+	}
+	// 截断判定：转发过有效帧，但上游既没给 finish_reason、也没给 [DONE] 就结束
+	// —— 连接中断（流超时 / 限流后直接关 TCP），不是「模型说完了」。
+	//
+	// 为什么保留 [DONE] 兜底而不换掉它：管理端 responses 转换层依赖 chat 流以
+	// [DONE] 收尾来补齐推理事件，去掉会让 /v1/responses 的思考内容显示不全
+	// （实测回归过、已回退）。所以收尾契约不动，只在 [DONE] **之前**插一条 error
+	// 帧：客户端（NarraFork 等）优先识别 error → 判失败 / 可续跑，不再把半截
+	// 回答当成完成；管理端 responses.py 也会把无 choices 的 error 帧转成
+	// response.failed。
+	//
+	// 判据与非流式 Aggregate 同构：那边同样以 !sawDone 认定「未正常收尾」。
+	// 空流（validFrames == 0）走上方的 errEmptyStream 分支，不重复判定。
+	truncated := validFrames > 0 && !sawDone && !sawFinish
+	if truncated {
+		// 本地判定帧不走 writeRaw：它的 hintFn 是给**上游** error 帧配建议用的，
+		// 这里不是上游错误，不编造 hint。
+		if _, werr := io.WriteString(w,
+			"data: {\"error\":{\"message\":\"upstream stream ended before completion\",\"type\":\"upstream_error\",\"code\":\"upstream_truncated\"}}\n\n"); werr != nil {
+			return werr
+		}
+	}
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		return err
 	}
@@ -606,7 +750,36 @@ readLoop:
 	if validFrames == 0 {
 		return errEmptyStream
 	}
+	if truncated {
+		return errTruncatedStream
+	}
 	return nil
+}
+
+// frameHasFinish 判断一帧是否携带收尾信号（choices[].finish_reason 非 null / 非空）。
+// 只用于流式帧序重排（issue #135）：收尾帧之后的帧要被缓冲。
+func frameHasFinish(obj map[string]any) bool {
+	chs, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ci := range chs {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		switch v := c["finish_reason"].(type) {
+		case nil:
+			// null = 还在生成
+		case string:
+			if v != "" {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

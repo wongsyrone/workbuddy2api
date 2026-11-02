@@ -30,11 +30,12 @@ type APIKeyEntry struct {
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string            `json:"listen"`     // ":7863"
-	APIKey    string            `json:"api_key"`    // 空 = 不鉴权；主密钥，不限分组
-	AuthDir   string            `json:"auth_dir"`   // ./auths
-	StateFile string            `json:"state_file"` // ./data/state.json
-	Proxies   map[string]string `json:"proxies"`
+	ReasoningAsContent *bool             `json:"reasoning_as_content"`
+	Listen             string            `json:"listen"`     // ":7863"
+	APIKey             string            `json:"api_key"`    // 空 = 不鉴权；主密钥，不限分组
+	AuthDir            string            `json:"auth_dir"`   // ./auths
+	StateFile          string            `json:"state_file"` // ./data/state.json
+	Proxies            map[string]string `json:"proxies"`
 
 	// APIKeys 分组密钥表：每把密钥可绑定若干**业务分组**，请求命中该密钥时只在与
 	// 这些分组有交集的账号中选号。
@@ -286,6 +287,8 @@ func Default() *Config {
 	// 显式 client_name="SaaS" 还原旧行为。
 	c.Upstream.ClientName = "WorkBuddy"
 	c.Features.SanitizeBlacklistFingerprints = true
+	reasoningFallback := true
+	c.ReasoningAsContent = &reasoningFallback
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
@@ -351,6 +354,10 @@ func Load(path string) (*Config, error) {
 }
 
 func applyEnv(c *Config) {
+	if v := strings.TrimSpace(os.Getenv("WB2A_REASONING_AS_CONTENT")); v != "" {
+		on := !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off"))
+		c.ReasoningAsContent = &on
+	}
 	if v := strings.TrimSpace(os.Getenv("WB2A_PROXIES")); v != "" {
 		var table map[string]string
 		if err := json.Unmarshal([]byte(v), &table); err == nil {
@@ -515,6 +522,10 @@ func (c *Config) normalize() error {
 	// 出口线路表：名字与地址都去空白；scheme 只认 http/https/socks5/socks5h。
 	// 这里**启动即校验**：地址写错时让上游起不来（带明确提示），比跑起来以后每个
 	// 请求都失败容易发现得多；线路名查不到（账号引用了不存在的名字）则在用时明确报错。
+	if c.ReasoningAsContent == nil {
+		on := true
+		c.ReasoningAsContent = &on
+	}
 	if len(c.Proxies) > 0 {
 		clean := make(map[string]string, len(c.Proxies))
 		for name, addr := range c.Proxies {
