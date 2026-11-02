@@ -42,6 +42,7 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+	ProxyName   string
 
 	// Groups 账号的**业务分组标签**（如 ["internal","external"]），落盘于文件**顶层**
 	// groups 键（嵌套形/扁平形同一位置，与 device_token 同风格）。
@@ -348,6 +349,7 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken string `json:"device_token"`
 			// Groups 顶层 groups（嵌套形与扁平形共用）：账号业务分组标签。
 			Groups []string `json:"groups"`
+			Proxy  string   `json:"proxy"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -362,6 +364,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			ProxyName:    strings.TrimSpace(n.Proxy),
 			Groups:       normalizeGroups(n.Groups),
 		}
 	} else {
@@ -376,6 +379,7 @@ func Parse(raw []byte) (*Auth, error) {
 			Nickname     string   `json:"nickname"`
 			DeviceToken  string   `json:"device_token"`
 			Groups       []string `json:"groups"`
+			Proxy        string   `json:"proxy"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -390,6 +394,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			ProxyName:    strings.TrimSpace(f.Proxy),
 			Groups:       normalizeGroups(f.Groups),
 		}
 	}
@@ -436,6 +441,9 @@ func (a *Auth) SaveAtomic() error {
 	// 删掉。账号的 token 刷新（RefreshToken → SaveAtomic）是高频路径，漏写 groups 会让
 	// 分组标签"自己消失"——而且是静默的：标签没了 → 默认拒绝策略下账号被所有分组密钥
 	// 忽略 → 表现为"某分组突然无号可用"，但文件里看不到任何报错。
+	if a.ProxyName != "" {
+		doc["proxy"] = a.ProxyName
+	}
 	if len(a.Groups) > 0 {
 		doc["groups"] = a.Groups
 	}

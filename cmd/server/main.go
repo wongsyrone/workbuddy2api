@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -165,6 +166,10 @@ func main() {
 	// 积分耗尽后的冷却时长（cooldown.credit_exhausted，issue #78）：0 = 保持
 	// 「硬冷却到次日 04:00」旧行为；配了就只退出这一小段再回候选池。
 	p.SetCreditExhausted(cfg.CreditExhaustedDur)
+	upstream.ConfigureProxies(cfg.Proxies)
+	if names := upstream.RouteNames(); len(names) > 0 {
+		log.Printf("出口线路已加载：%s", strings.Join(names, ", "))
+	}
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 

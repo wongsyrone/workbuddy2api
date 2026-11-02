@@ -36,9 +36,9 @@ import (
 // cfgFile 只取本工具需要的字段；Schedule 段直接用 internal/config.Schedule
 // （与 cmd/server 同源），其余段保持精简内联。
 type cfgFile struct {
-	AuthDir   string            `json:"auth_dir"`
-	StateFile string            `json:"state_file"`
-	Schedule  config.Schedule   `json:"schedule"`
+	AuthDir   string          `json:"auth_dir"`
+	StateFile string          `json:"state_file"`
+	Schedule  config.Schedule `json:"schedule"`
 	Upstream  struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
@@ -103,7 +103,7 @@ func main() {
 		CheckinHours:        c.Schedule.CheckinHours,
 		TravelHours:         c.Schedule.TravelHours,
 		ActivityHours:       c.Schedule.ActivityHours,
-		KeepaliveHours:       c.Schedule.KeepaliveHours,
+		KeepaliveHours:      c.Schedule.KeepaliveHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
 		JitterMinutes:       c.Schedule.JitterMinutes, // 本工具一次性触发、从不进 Run 循环，抖动无实际作用；一并接线保持构造完整
 	})
@@ -116,6 +116,9 @@ func main() {
 // 但 GlobalEnabled=false 会把工具自造的 global 账号请求路由到 CN base（codebuddy.cn）而必然失败。
 // 与 cmd/signin、cmd/credit、cmd/trial 同风格：显式接线，避免 Producer 误读成「未适配」。
 func newUpstream(c *cfgFile) *upstream.Client {
+	// 出口线路（issue #210 补充）：独立二进制必须自己加载 proxies 段，
+	// 否则账号绑定的线路名解析不到，上报请求会走家宽出口或直接报错。
+	upstream.LoadRoutesAndLog(log.Printf)
 	up := upstream.New()
 	up.GlobalEnabled = true
 	if c.Upstream.TimeoutSeconds > 0 {

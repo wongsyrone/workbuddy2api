@@ -30,10 +30,11 @@ type APIKeyEntry struct {
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权；主密钥，不限分组
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen    string            `json:"listen"`     // ":7863"
+	APIKey    string            `json:"api_key"`    // 空 = 不鉴权；主密钥，不限分组
+	AuthDir   string            `json:"auth_dir"`   // ./auths
+	StateFile string            `json:"state_file"` // ./data/state.json
+	Proxies   map[string]string `json:"proxies"`
 
 	// APIKeys 分组密钥表：每把密钥可绑定若干**业务分组**，请求命中该密钥时只在与
 	// 这些分组有交集的账号中选号。
@@ -350,6 +351,12 @@ func Load(path string) (*Config, error) {
 }
 
 func applyEnv(c *Config) {
+	if v := strings.TrimSpace(os.Getenv("WB2A_PROXIES")); v != "" {
+		var table map[string]string
+		if err := json.Unmarshal([]byte(v), &table); err == nil {
+			c.Proxies = table
+		}
+	}
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
 	}
@@ -505,6 +512,34 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
+	// 出口线路表：名字与地址都去空白；scheme 只认 http/https/socks5/socks5h。
+	// 这里**启动即校验**：地址写错时让上游起不来（带明确提示），比跑起来以后每个
+	// 请求都失败容易发现得多；线路名查不到（账号引用了不存在的名字）则在用时明确报错。
+	if len(c.Proxies) > 0 {
+		clean := make(map[string]string, len(c.Proxies))
+		for name, addr := range c.Proxies {
+			n := strings.TrimSpace(name)
+			v := strings.TrimSpace(addr)
+			if n == "" || v == "" {
+				continue
+			}
+			u, err := url.Parse(v)
+			if err != nil {
+				return fmt.Errorf("proxies[%s]: %w", n, err)
+			}
+			switch strings.ToLower(u.Scheme) {
+			case "http", "https", "socks5", "socks5h":
+			default:
+				return fmt.Errorf("proxies[%s]: 不支持的协议 %q（只能是 http/https/socks5/socks5h）", n, u.Scheme)
+			}
+			if u.Host == "" {
+				return fmt.Errorf("proxies[%s]: 地址缺少主机名（%q）", n, v)
+			}
+			clean[n] = v
+		}
+		c.Proxies = clean
+	}
+
 	var err error
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
