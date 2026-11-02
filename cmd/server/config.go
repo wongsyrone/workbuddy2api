@@ -58,7 +58,8 @@ type Config struct {
 		SoftRate string `json:"soft_rate"` // "600s"，软限流冷却基数
 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
-		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		SoftRateMax     string `json:"soft_rate_max"`
+		CreditExhausted string `json:"credit_exhausted"` // "2h"
 	} `json:"cooldown"`
 
 	Schedule config.Schedule `json:"schedule"`
@@ -449,6 +450,7 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_CREDIT_EXHAUSTED"); v != "" {
 		c.Pool.CreditExhausted = v
+		c.Cooldown.CreditExhausted = v
 	}
 	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -527,6 +529,10 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
+	// Keep the existing pool key compatible with the upstream cooldown key.
+	if c.Cooldown.CreditExhausted != "" {
+		c.Pool.CreditExhausted = c.Cooldown.CreditExhausted
+	}
 	// 出口线路表：名字与地址都去空白；scheme 只认 http/https/socks5/socks5h。
 	// 这里**启动即校验**：地址写错时让上游起不来（带明确提示），比跑起来以后每个
 	// 请求都失败容易发现得多；线路名查不到（账号引用了不存在的名字）则在用时明确报错。

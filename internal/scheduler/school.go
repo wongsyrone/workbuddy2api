@@ -7,6 +7,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -52,6 +53,9 @@ type scriptCmd struct{ cmd *exec.Cmd }
 
 func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
 func (c *scriptCmd) Run() error        { return c.cmd.Run() }
+func (c *scriptCmd) SetContext(ctx context.Context) {
+	c.cmd = exec.CommandContext(ctx, c.cmd.Path, c.cmd.Args[1:]...)
+}
 
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
 // 工作目录由调用方 SetDir 显式设置仓库根。
@@ -82,8 +86,18 @@ func pythonCmd() string {
 // 返回成功/失败命令数与最后一条失败摘要，供台账计数（note 取最后一条：多命令
 // 全挂时最有价值的是「最近一次为什么挂」，逐条细节已在日志里）。
 func runScript(name, root string, commands [][]string) (ok, fail int, note string) {
+	return runScriptContext(context.Background(), name, root, commands)
+}
+
+func runScriptContext(ctx context.Context, name, root string, commands [][]string) (ok, fail int, note string) {
 	for _, cmdArgs := range commands {
+		if ctx.Err() != nil {
+			return ok, fail, ctx.Err().Error()
+		}
 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
+		if setter, ok := c.(interface{ SetContext(context.Context) }); ok {
+			setter.SetContext(ctx)
+		}
 		c.SetDir(root)
 		if err := c.Run(); err != nil {
 			fail++
@@ -103,8 +117,15 @@ func runScript(name, root string, commands [][]string) (ok, fail int, note strin
 // 退出码非 0 即算 Fail（脚本自己会把「活动下线」「非窗口期」等正常态处理成 0 退出，
 // 见 RunSchoolNow/RunCatNow 的注释），所以这里的 Fail 就是真的失败了。
 func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands [][]string) {
+	s.runScriptTaskContext(context.Background(), kind, trigger, name, commands)
+}
+
+func (s *Scheduler) runScriptTaskContext(ctx context.Context, kind taskKind, trigger, name string, commands [][]string) {
+	for i := range commands {
+		commands[i] = s.accountScriptArgs(ctx, commands[i])
+	}
 	started := time.Now()
-	okN, failN, note := runScript(name, repoRoot(), commands)
+	okN, failN, note := runScriptContext(ctx, name, repoRoot(), commands)
 	s.recordRun(kind, trigger, started, runTally{
 		total: okN + failN, ok: okN, fail: failN, note: note,
 	})
@@ -117,7 +138,11 @@ func (s *Scheduler) RunSchoolNow() { s.runSchool(triggerManual) }
 // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
 // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
 func (s *Scheduler) runSchool(trigger string) {
-	s.runScriptTask(taskSchool, trigger, "school", [][]string{
+	s.runSchoolContext(context.Background(), trigger)
+}
+
+func (s *Scheduler) runSchoolContext(ctx context.Context, trigger string) {
+	s.runScriptTaskContext(ctx, taskSchool, trigger, "school", [][]string{
 		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
 	})
 }
@@ -129,7 +154,11 @@ func (s *Scheduler) RunCatNow() { s.runCat(triggerManual) }
 // black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
 // 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
 func (s *Scheduler) runCat(trigger string) {
-	s.runScriptTask(taskCat, trigger, "cat", [][]string{
+	s.runCatContext(context.Background(), trigger)
+}
+
+func (s *Scheduler) runCatContext(ctx context.Context, trigger string) {
+	s.runScriptTaskContext(ctx, taskCat, trigger, "cat", [][]string{
 		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
 	})
 }

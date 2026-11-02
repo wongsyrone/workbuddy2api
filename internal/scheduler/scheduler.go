@@ -278,6 +278,7 @@ func (k taskKind) String() string {
 // fireAt 返回某类任务在 now 之后的最近触发时刻，按配置选择抖动模式：
 //   - RandomDelayMinutes > 0：scheduledSlot 在小时窗口内随机选时刻（sha256 派生）
 //   - 否则：nextFire 的 jitterOffset（整点后偏移，fnv 派生）
+//
 // 两种都是确定性派生，重启后同一 slot 时刻稳定。
 func (s *Scheduler) fireAt(now time.Time, hours []int, kind taskKind) time.Time {
 	if s.cfg.RandomDelayMinutes > 0 {
@@ -428,6 +429,15 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 	// 排程遍历标记：accountGap/accountScriptArgs 只对本 ctx 派生的调用加账号间抖动，
 	// 手动入口（RunXxxNow，走 context.Background()）不带此标记、保持原行为。
 	ctx = context.WithValue(ctx, scheduledAccountKey{}, true)
+	if s.cfg.AccountDelayMaxSeconds > 0 {
+		for _, kind := range kinds {
+			if ctx.Err() != nil {
+				return
+			}
+			s.dispatch(ctx, kind)
+		}
+		return
+	}
 	var wg sync.WaitGroup
 	for _, k := range kinds {
 		wg.Add(1)
@@ -452,17 +462,17 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 	}
 	switch k {
 	case taskCheckin:
-		s.runCheckin(trigger)
+		s.runCheckinContext(ctx, trigger)
 	case taskTravel:
 		s.runTravel(ctx, trigger)
 	case taskActivity:
 		s.runActivity(ctx, trigger)
 	case taskKeepalive:
-		s.runKeepalive(trigger)
+		s.runKeepaliveContext(ctx, trigger)
 	case taskSchool:
-		s.runSchool(trigger)
+		s.runSchoolContext(ctx, trigger)
 	case taskCat:
-		s.runCat(trigger)
+		s.runCatContext(ctx, trigger)
 	}
 }
 
@@ -477,8 +487,12 @@ func (s *Scheduler) RunCheckinNow() { s.runCheckin(triggerManual) }
 // out 为空 → total=0、fail=0 → 不判全灭、不排重试，这是对的——「与另一次签到
 // 撞车」不是失败。
 func (s *Scheduler) runCheckin(trigger string) ([]CheckinOutcome, error) {
+	return s.runCheckinContext(context.Background(), trigger)
+}
+
+func (s *Scheduler) runCheckinContext(ctx context.Context, trigger string) ([]CheckinOutcome, error) {
 	started := time.Now()
-	out, err := s.CheckinAll()
+	out, err := s.checkinAll(ctx)
 	if err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
@@ -507,6 +521,58 @@ func (s *Scheduler) runCheckin(trigger string) ([]CheckinOutcome, error) {
 // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
 // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
 func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+	return s.checkinAll(context.Background())
+}
+
+// checkinAccountDelay 相邻账号之间的最小间隔（issue #256）。
+//
+// 12 个账号一轮里，3 个国内版的签到请求落在 3 秒窗口内，上游直接回
+// `http 500 {"code":10001,"msg":"签到失败，请稍后重试"}`；同一批账号当天稍后
+// 手动单独点击全部成功，因此不是账号问题而是短时并发被限流。串行 + 固定间隔
+// 把一轮 12 个号摊到 30 秒以上，远低于上游限流窗口。
+// 配置了 account-delay-min/max 的定时遍历会在此基础上再叠加随机抖动（accountGap）。
+// 测试可置 0。
+var checkinAccountDelay = 3 * time.Second
+
+// checkinRetryDelays 签到遇到上游瞬时拒绝时的退避序列（issue #256）。
+//
+// 只对 HTTP 5xx 与业务码 10001 生效；"今天已签到"（同样是 10001）在判定前已按
+// 幂等成功处理，不会走到这里。重试次数 = len(checkinRetryDelays)，全部失败才
+// 记 fail_checkin。测试可置空。
+var checkinRetryDelays = []time.Duration{5 * time.Second, 15 * time.Second, 60 * time.Second}
+
+// checkinRetryable 报告签到错误是否属于上游瞬时拒绝（值得退避重试）。
+// 单号手动签到都能成功而批量偶发失败，说明 10001 在这里表达的是"稍后重试"，
+// 而不是账号或参数问题——这类错误直接记 fail 只能等下一轮定时，白白错过当天。
+func checkinRetryable(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	if ue.Status >= 500 && ue.Status <= 599 {
+		return true
+	}
+	return upstream.CodeOf(ue.Msg) == "10001"
+}
+
+// dailyCheckinWithRetry 执行签到，遇到上游瞬时失败（HTTP 5xx / code 10001）
+// 按 checkinRetryDelays 退避重试；ctx 取消立即返回最后一次错误。
+func (s *Scheduler) dailyCheckinWithRetry(ctx context.Context, a *auth.Auth, label string) error {
+	err := s.cfg.Upstream.DailyCheckin(a)
+	for i, delay := range checkinRetryDelays {
+		if err == nil || upstream.IsAlreadyCheckin(err) || !checkinRetryable(err) {
+			return err
+		}
+		log.Printf("checkin %s: %v — %s 后重试(%d/%d)", label, err, delay, i+1, len(checkinRetryDelays))
+		if !sleepCtx(ctx, delay) {
+			return err
+		}
+		err = s.cfg.Upstream.DailyCheckin(a)
+	}
+	return err
+}
+
+func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 	if !s.checkinMu.TryLock() {
 		return nil, ErrBusy
 	}
@@ -515,7 +581,18 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	started := time.Now()
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
-	var okN, alreadyN, failN, skipN int
+	var okN, alreadyN, failCheckinN, failResourceN, skipN int
+	first := true
+	pace := func() bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		if first {
+			first = false
+			return true
+		}
+		return sleepCtx(ctx, s.accountGap(ctx, checkinAccountDelay))
+	}
 	for _, st := range statuses {
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
 		if st.Disabled {
@@ -534,6 +611,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		if !pace() {
+			return out, ctx.Err()
+		}
 		if a.IsGlobal() {
 			if a.NeedsRefresh(checkinRefreshSkew) {
 				if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -545,6 +625,18 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			}
 			oc.Status, oc.Detail = CheckinSkipped, "global"
 			skipN++
+			// 签到仍然跳过（global 没有签到体系），但**只读**余额必须刷新：
+			// 否则 pool 里的 credits 恒 0，weightOf 的「余额 / 快过期」两个
+			// 因子对 global 完全失效，选号退化成纯轮询（issue #228）。
+			// UserResourceDetailed 只调 billing/meter 只读接口，不碰签到，
+			// 风控语义与 D4 门控一致。
+			if remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow); err != nil {
+				log.Printf("user-resource(global) %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			} else {
+				s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+				s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+				oc.Credits = &remain
+			}
 			out = append(out, oc)
 			continue
 		}
@@ -563,7 +655,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				// 会让本可成功的签到被白白跳过）；真正过期才判定失败。
 				if a.NeedsRefresh(0) {
 					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
-					failN++
+					failCheckinN++
 					out = append(out, oc)
 					continue
 				}
@@ -577,7 +669,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			}
 		}
 		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		// 瞬时失败（HTTP 5xx / 10001）先在原地退避重试，避免错过当天签到。
+		if err := s.dailyCheckinWithRetry(ctx, a, logfmt.Label(st.UID, st.Nickname)); err != nil {
 			if upstream.IsAlreadyCheckin(err) {
 				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
 				// 出现一整段 400 报文、被误读成签到失败。
@@ -597,7 +690,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
-			failN++
+			failResourceN++
 			out = append(out, oc)
 			continue
 		}
@@ -610,12 +703,12 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		case CheckinAlready:
 			alreadyN++
 		default:
-			failN++
+			failCheckinN++
 		}
 		out = append(out, oc)
 	}
-	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
-		len(statuses), okN, alreadyN, failN, skipN)
+	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d fail_checkin=%d fail_resource=%d",
+		len(statuses), okN, alreadyN, failCheckinN+failResourceN, skipN, failCheckinN, failResourceN)
 	// 顺带做一次签到活动到期预警（只读探测，不影响签到结果；见 checkin_activity.go）。
 	s.warnCheckinActivity(statuses)
 	// 结果回调（落盘供控制台回放）：手动入口与定时排程共用此处，两条路径口径一致。
@@ -928,6 +1021,11 @@ func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(triggerManual) }
 // 计数口径：刷新成功记 OK，刷新报错记 Fail（含 12153）；禁用号与无 refresh token
 // 的号记 Skipped。落盘失败不计 Fail——token 已经刷到手，重试救不了磁盘。
 func (s *Scheduler) runKeepalive(trigger string) {
+	s.runKeepaliveContext(context.Background(), trigger)
+}
+
+func (s *Scheduler) runKeepaliveContext(ctx context.Context, trigger string) {
+	first := true
 	started := time.Now()
 	var t runTally
 	for _, st := range s.cfg.Pool.List() {
@@ -940,6 +1038,10 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			t.skipped++
 			continue
 		}
+		if ctx.Err() != nil || (!first && !sleepCtx(ctx, s.accountGap(ctx, 0))) {
+			break
+		}
+		first = false
 		t.total++
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			t.fail++
