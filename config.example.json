@@ -3,11 +3,17 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "proxies": {},
+  "reasoning_as_content": true,
   "cooldown": {
     "soft_rate": "600s",
-    "soft_rate_max": "2h"
+    "soft_rate_max": "2h",
+    "credit_exhausted": ""
   },
   "schedule": {
+    "account_delay_min_seconds": 0,
+    "account_delay_max_seconds": 0,
+    "random_delay_minutes": 0,
     "checkin_hours": [
       9,
       21
@@ -81,7 +87,8 @@
     "device_token": "",
     "device_token_file": "",
     "client_name": "WorkBuddy",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "gzip_body": true
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
@@ -97,6 +104,8 @@
     "token": ""
   },
   "pool": {
+    "large_request_bytes": 262144,
+    "large_request_cooldown": "90s",
     "max_in_flight": 3,
     "max_in_flight_global": 2,
     "breaker_threshold": 3,

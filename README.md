@@ -85,7 +85,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
   - `custom`：网关用自有提示词**替换**客户端 system/developer（从源头消除模板句误报；不参与降级）
   - `append`：**两者并用**——开头连续 system/developer 块之后插入网关自有提示词，客户端项目规范/工具约定与网关人格共存（issue #129）；降级期与拦截首遇重试时退化为 `custom` 语义（换中性提示词，原文 system 移除）
   - `prompt.file`（custom/append 生效）指向自定义提示词文件，空 = 内置默认
-- **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传，客户端缺省会话 ID 时用轮级聚合键兜底合成、**该头恒发**（上游渠道校验要求，缺头会被判非官方客户端并拒收，见 #36） · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
+- **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传，客户端缺省时按首条 user 文本派生稳定会话头，再依次回落会话键、请求级随机值，**该头恒发** · B3 链路）。轮转 / 重试 / 路径回退复用同键；会话头与既有 prompt-cache 身份分开，保留缓存键语义。
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
 
 ### 选号语义
@@ -174,6 +174,27 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
+### 账号线路与兼容配置
+
+以下字段可在 `config.example.json` 中查看完整位置：
+
+| 配置 | 默认值 | 行为 |
+|---|---|---|
+| `proxies` | `{}` | 线路名到 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理地址的映射。账号文件顶层 `proxy` 写线路名；`__direct__` 强制直连，空值沿用进程级代理。未知线路报错。 |
+| `reasoning_as_content` | `true` | 整轮既无正文、又无工具调用时，把 reasoning 同时作为正文输出；同时展示两个通道的客户端可能重复显示。可设 `false` 或 `WB2A_REASONING_AS_CONTENT=0` 关闭。 |
+| `upstream.gzip_body` | `true` | 对至少 64 KiB 的出站请求尝试 gzip；压缩无收益则保留原文，上游拒绝压缩或渠道校验失败时改用未压缩请求重试。 |
+| `pool.large_request_bytes` / `large_request_cooldown` | `262144` / `"90s"` | 大请求跳过粘性绑定，优先避开窗口内承接过大请求的账号；全部候选都在窗口内时回落普通轮换。阈值设 `-1` 关闭。 |
+| `schedule.account_delay_min_seconds` / `account_delay_max_seconds` | `0` / `0` | 定时任务账号之间额外随机等待，要求 `0 <= min <= max <= 600`。人工入口不叠加随机间隔；签到仍保留相邻账号至少 3 秒的基本间隔。 |
+| `schedule.random_delay_minutes` | `0` | 在原定小时内摊开任务，范围 `0..60`；启用后优先于既有 `jitter_minutes`，同一天重启保持稳定。 |
+| `cooldown.credit_exhausted` | `""` | 积分耗尽后的短冷却，例如 `"10m"`；空值沿用次日 04:00 恢复。兼容旧键 `pool.credit_exhausted`，同时配置时以非空的 `cooldown` 键为准。 |
+| `features.sanitize_extra_features` / `sanitize_extra_rewrites` | `[]` / `[]` | 追加净化预检词和 `[原文, 替换文本]` 规则；受既有净化总开关控制。 |
+
+账号文件顶层还支持 `weight` 乘数：未设置或 `0` 等价于 `1`，选号时钳制到 `0.1..100`，刷新凭证时保留该字段。粘性会话首绑与普通轮换都使用该权重。
+
+独立的 `signin` / `credit` / `activity` / `trial` 工具也读取配置文件中的 `proxies`。配置路径按 `WB2A_CONFIG`、当前目录 `config.json`、容器 `/app/conf/config.json` 查找。服务端另支持 `WB2A_PROXIES` JSON 环境变量覆盖；独立工具使用文件中的线路表。
+
+刷新 token 收到 HTTP 429 时，账号进入独立的 `refresh_risk` 暂停，等待限制在 5 分钟至 6 小时；恢复后短时间内连续三轮再命中会要求人工复查。暂停期间该账号退出选号与 Go 定时任务；批量 school / cat 脚本会整体跳过，避免脚本绕过保护。`POST /admin/accounts/{uid}/refresh-risk/clear` 专门解除此状态，普通 enable / revive 不会解除它；需开启管理接口，并使用无业务分组限制的运维密钥，操作沿用审计规则。
+
 ## 快速开始
 
 ### 环境要求
@@ -207,17 +228,16 @@ curl -s http://localhost:7863/healthz
 
 `login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + `auths/workbuddy-<uid>.json` 落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
 
-> **国内网络下构建会卡在第一层**：镜像构建的第一步是 `go mod download`，默认走官方
-> `proxy.golang.org` —— 中国大陆不可达，表现为长时间停在这一层（看着像构建挂了），
-> 有时直接失败。换个国内代理即可：
+> 镜像构建默认使用 `GOPROXY=https://goproxy.cn,direct` 和
+> `APK_MIRROR=mirrors.aliyun.com`。需要官方源或其它镜像时可覆盖构建参数：
 >
 > ```bash
-> docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+> docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct --build-arg APK_MIRROR=dl-cdn.alpinelinux.org
 > docker compose up -d
 > ```
 >
-> 也可以直接填进 `docker-compose.yml` 的 `build.args.GOPROXY`。留空 = 官方默认，
-> 与改动前行为一致。
+> 也可以在 `docker-compose.yml` 的 `build.args` 中配置。`GOPROXY` 留空沿用 Go 默认源；
+> `APK_MIRROR` 留空保留基础镜像的仓库设置。
 
 > **非 root 宿主用户注意**：`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
 >
