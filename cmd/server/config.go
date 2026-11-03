@@ -589,7 +589,7 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
 	}
 	if c.Pool.LargeRequestCooldown == "" {
-		c.Pool.LargeRequestCooldown = "90s"
+		c.Pool.LargeRequestCooldown = "0s"
 	}
 	if c.LargeRequestCooldownDur, err = time.ParseDuration(c.Pool.LargeRequestCooldown); err != nil {
 		return fmt.Errorf("pool.large_request_cooldown: %w", err)

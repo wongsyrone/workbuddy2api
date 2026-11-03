@@ -216,7 +216,7 @@ type Handler struct {
 // largeExclusions 返回「LargeRequestCooldown 窗口内已承接过大请求」的号集合，
 // 顺手清掉过期项。窗口内这些号不再参与大请求选号 —— 这就是逐请求轮换。
 func (h *Handler) largeExclusions(now time.Time) map[string]bool {
-	if h.cfg.LargeRequestBytes <= 0 {
+	if h.cfg.LargeRequestBytes <= 0 || h.cfg.LargeRequestCooldown <= 0 {
 		return nil // 策略关闭：不排除任何号
 	}
 	h.largeMu.Lock()
@@ -259,9 +259,6 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.LargeRequestBytes == 0 {
 		cfg.LargeRequestBytes = 256 << 10
-	}
-	if cfg.LargeRequestCooldown <= 0 {
-		cfg.LargeRequestCooldown = 90 * time.Second
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -1004,8 +1001,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		keyGroups = ki.Groups
 	}
 
-	largeCtx := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes
-	if largeCtx {
+	// Rotation breaks account-local prefix caches, so it requires an explicit positive window.
+	largeRotate := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes &&
+		h.cfg.LargeRequestCooldown > 0
+	if largeRotate {
 		unbindSticky()
 	}
 	modelBlocksCleared := false
@@ -1025,7 +1024,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知 + 分组感知选号：模型非空时启用 6004 模型级冷却
 			// 豁免（healthyForModel），realm 谓词过滤跨域账号，groups 谓词过滤跨组账号。
 			pickTried := tried
-			if largeCtx {
+			if largeRotate {
 				if extra := h.largeExclusions(time.Now()); len(extra) > 0 {
 					pickTried = make(map[string]bool, len(tried)+len(extra))
 					for k, v := range tried {
@@ -1037,11 +1036,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			acct = h.cfg.Pool.PickExcludingForRealmGroups(pickTried, bareModel, realm, keyGroups)
-			if acct == nil && largeCtx {
+			if acct == nil && largeRotate {
 				// 所有号都在大请求窗口内：退化普通轮换，避免直接 503。
 				acct = h.cfg.Pool.PickExcludingForRealmGroups(tried, bareModel, realm, keyGroups)
 			}
-			if acct != nil && largeCtx {
+			if acct != nil && largeRotate {
 				h.noteLargeUse(acct.UID, time.Now())
 			}
 		}
@@ -1301,7 +1300,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if stickyKey != "" && h.cfg.Session != nil && !largeCtx {
+		if stickyKey != "" && h.cfg.Session != nil && !largeRotate {
 			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {

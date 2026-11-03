@@ -105,7 +105,7 @@
   },
   "pool": {
     "large_request_bytes": 262144,
-    "large_request_cooldown": "90s",
+    "large_request_cooldown": "0s",
     "max_in_flight": 3,
     "max_in_flight_global": 2,
     "breaker_threshold": 3,
