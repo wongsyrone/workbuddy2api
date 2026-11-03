@@ -668,7 +668,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	// 已失效，revive 只会让它立刻再死一次，只有重新登录（换 refresh token）能救。
 	// 用 Contains 而非 == 常量：state.json 是持久化的，历史上/手工写入的 reason
 	// 文案可能有前后缀（"12153 session dead"/"上游 12153"），精确匹配会漏判。
-	st.NeedsRelogin = st.Disabled && (st.SessionDeadFails > 0 || strings.Contains(e.reason, "12153"))
+	// 明确的上游封禁优先于历史凭证失败计数，重新登录不能解除封禁。
+	st.NeedsRelogin = st.Disabled && !strings.Contains(e.reason, "re-login ineffective") &&
+		(st.SessionDeadFails > 0 || strings.Contains(e.reason, "12153"))
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason

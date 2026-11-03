@@ -170,11 +170,6 @@ const notFoundCooldown = 60 * time.Second
 // 抖动复用 backoff.go jitterDur（单一来源，不重复造轮子）。
 const wafCooldownBase = 60 * time.Second
 
-// upstreamRestrictionCooldown 上游「账号异常行为」风控限制的软冷却时长。
-// 这类限制可申诉、会自行解除（现场观测同一账号数小时后恢复 200），
-// 而凭证本身有效 —— 因此只把它移出轮换，不 Disable、不清凭证。
-const upstreamRestrictionCooldown = 45 * time.Minute
-
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -1598,11 +1593,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			return
 		}
 		if upstream.IsUpstreamRestriction(body) {
-			// 11140 + 「账号存在异常行为，已被限制使用」→ 账号级风控限制（可申诉）。
-			// 与「request illegal / auth_forbidden」不同：限制会解除，凭证没坏 ——
-			// 软冷却期间退出轮换即可，48 分钟后再试，不要永久禁用。
-			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, upstreamRestrictionCooldown,
-				"upstream restriction ("+upstreamCodeLabel(body, uerr)+", appealable)")
+			// 11140 + 「账号存在异常行为，已被限制使用」= 上游账号封禁，需向腾讯申诉；
+			// 重新登录不能解除，也不该在池子里反复重试。
+			//
+			// 0043 曾把它当「可自行恢复」做 45 分钟软冷却，但现场反馈是账号一直在
+			// 「冷却中」循环、面板看不出哪个号被封（issue #376）；这里恢复为明确
+			// 禁用并写清原因 —— 面板据此显示「账号被封禁」、移出重登队列、停止
+			// 继续消耗请求（与 #361 的封禁展示同一口径）。
+			h.cfg.Pool.Disable(uid, "account banned by upstream ("+
+				upstreamCodeLabel(body, uerr)+
+				", 账号存在异常行为/已被限制使用, appeal required, re-login ineffective)")
 			return
 		}
 		if strings.Contains(lowerBody, "request illegal") {
