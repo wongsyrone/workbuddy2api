@@ -43,6 +43,7 @@ const (
 	ErrEmptyMessage                        // Request content is invalid; do not rotate accounts.
 	ErrToolCallMismatch                    // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
 	ErrAuthRejected                        // Repeated HTTP 401 responses without a session-dead code.
+	ErrUpstreamQueue                       // 429 + 6020 全局排队，不冷却或禁用账号。
 )
 
 func (k ErrKind) String() string {
@@ -81,6 +82,8 @@ func (k ErrKind) String() string {
 		return "client"
 	case ErrAuthRejected:
 		return "auth_rejected"
+	case ErrUpstreamQueue:
+		return "upstream_queue"
 	default:
 		return "none"
 	}
@@ -587,6 +590,11 @@ func isToolCallMismatch(lower string) bool {
 		codeMarker(lower, "11148")
 }
 
+// IsUpstreamQueue 识别 6020 或 queue.waiting，调用方另行限制 HTTP 状态码。
+func IsUpstreamQueue(body string) bool {
+	return strings.Contains(strings.ToLower(body), "queue.waiting") || hasBusinessCode(body, "6020")
+}
+
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -629,6 +637,9 @@ func Classify(status int, body string) ErrKind {
 	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
+	}
+	if status == http.StatusTooManyRequests && IsUpstreamQueue(body) {
+		return ErrUpstreamQueue
 	}
 	// status==429 先于 hardRule（fork-scan-absorb T-3）：限流响应 body
 	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
