@@ -44,10 +44,12 @@ type Config struct {
 	//
 	// 鉴权时**遍历全表且不在命中处短路**（见 matchAuthKey）：多密钥下"命中即 break"
 	// 会让总耗时随匹配位置变化，等于把"某密钥是否存在、排第几"透给探测者。
-	AuthKeys             []AuthKey
-	LargeRequestBytes    int
-	LargeRequestCooldown time.Duration
-	MaxRotate            int // 单请求最多换号次数，默认 3
+	AuthKeys                 []AuthKey
+	LargeRequestBytes        int
+	LargeRequestCooldown     time.Duration
+	LargeRequestBudget       int
+	LargeRequestBudgetWindow time.Duration
+	MaxRotate                int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -189,7 +191,7 @@ type Handler struct {
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP     wafIPGate
 	largeMu   sync.Mutex
-	largeUsed map[string]time.Time
+	largeUsed map[string][]time.Time
 	// taskMu/taskRunning 手动任务触发的防重入闸（admin_tasks.go）：任务名 →
 	// 是否已有一次手动触发在跑。只挡「手动 vs 手动」连点；「手动 vs 定时」撞车
 	// 由 scheduler 自己的 checkinMu 兜。进程内状态、重启清零——重启后没有在跑的
@@ -207,12 +209,18 @@ type Handler struct {
 	lastCheckinUnix atomic.Int64
 }
 
-// NewHandler 构建 handler。
-// largeExclusions 返回「LargeRequestCooldown 窗口内已承接过大请求」的号集合，
-// 顺手清掉过期项。窗口内这些号不再参与大请求选号 —— 这就是逐请求轮换。
+// largeExclusions 避开窗口内已用满预算的账号；预算关闭时沿用逐请求轮换。
 func (h *Handler) largeExclusions(now time.Time) map[string]bool {
-	if h.cfg.LargeRequestBytes <= 0 || h.cfg.LargeRequestCooldown <= 0 {
+	if h.cfg.LargeRequestBytes <= 0 {
 		return nil // 策略关闭：不排除任何号
+	}
+	budgetMode := h.cfg.LargeRequestBudget > 0 && h.cfg.LargeRequestBudgetWindow > 0
+	window := h.cfg.LargeRequestBudgetWindow
+	if !budgetMode {
+		window = h.cfg.LargeRequestCooldown
+	}
+	if window <= 0 {
+		return nil
 	}
 	h.largeMu.Lock()
 	defer h.largeMu.Unlock()
@@ -220,12 +228,21 @@ func (h *Handler) largeExclusions(now time.Time) map[string]bool {
 		return nil
 	}
 	out := make(map[string]bool, len(h.largeUsed))
-	for uid, at := range h.largeUsed {
-		if now.Sub(at) < h.cfg.LargeRequestCooldown {
-			out[uid] = true
+	for uid, stamps := range h.largeUsed {
+		kept := stamps[:0]
+		for _, at := range stamps {
+			if now.Sub(at) < window {
+				kept = append(kept, at)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.largeUsed, uid)
 			continue
 		}
-		delete(h.largeUsed, uid)
+		h.largeUsed[uid] = kept
+		if !budgetMode || len(kept) >= h.cfg.LargeRequestBudget {
+			out[uid] = true
+		}
 	}
 	return out
 }
@@ -237,9 +254,9 @@ func (h *Handler) noteLargeUse(uid string, now time.Time) {
 	}
 	h.largeMu.Lock()
 	if h.largeUsed == nil {
-		h.largeUsed = make(map[string]time.Time)
+		h.largeUsed = make(map[string][]time.Time)
 	}
-	h.largeUsed[uid] = now
+	h.largeUsed[uid] = append(h.largeUsed[uid], now)
 	h.largeMu.Unlock()
 }
 
@@ -253,7 +270,13 @@ func NewHandler(cfg Config) *Handler {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
 	}
 	if cfg.LargeRequestBytes == 0 {
-		cfg.LargeRequestBytes = 256 << 10
+		cfg.LargeRequestBytes = 2 << 20
+	}
+	if cfg.LargeRequestBudget == 0 {
+		cfg.LargeRequestBudget = 6
+	}
+	if cfg.LargeRequestBudgetWindow <= 0 {
+		cfg.LargeRequestBudgetWindow = 120 * time.Second
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -996,17 +1019,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		keyGroups = ki.Groups
 	}
 
-	// Rotation breaks account-local prefix caches, so it requires an explicit positive window.
-	largeRotate := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes &&
-		h.cfg.LargeRequestCooldown > 0
-	if largeRotate {
+	// 预算内保持粘性以复用前缀缓存，用满后才迁移；负预算允许旧的逐请求轮换。
+	largeReq := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes
+	budgetMode := largeReq && h.cfg.LargeRequestBudget > 0 && h.cfg.LargeRequestBudgetWindow > 0
+	rotateMode := largeReq && !budgetMode && h.cfg.LargeRequestCooldown > 0
+	if rotateMode {
 		unbindSticky()
+	}
+	var hotAccounts map[string]bool
+	if budgetMode || rotateMode {
+		hotAccounts = h.largeExclusions(time.Now())
 	}
 	modelBlocksCleared := false
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if stickyUID != "" && !(budgetMode && hotAccounts[stickyUID]) {
 			// 粘性命中同样受分组约束：绑定号若属于其他密钥的分组，返回 nil → 解绑重分配。
 			acct = h.cfg.Pool.PickByUIDForModelGroups(stickyUID, bareModel, keyGroups)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
@@ -1019,8 +1047,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知 + 分组感知选号：模型非空时启用 6004 模型级冷却
 			// 豁免（healthyForModel），realm 谓词过滤跨域账号，groups 谓词过滤跨组账号。
 			pickTried := tried
-			if largeRotate {
-				if extra := h.largeExclusions(time.Now()); len(extra) > 0 {
+			if rotateMode || budgetMode {
+				if extra := hotAccounts; len(extra) > 0 {
 					pickTried = make(map[string]bool, len(tried)+len(extra))
 					for k, v := range tried {
 						pickTried[k] = v
@@ -1031,13 +1059,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			acct = h.cfg.Pool.PickExcludingForRealmGroups(pickTried, bareModel, realm, keyGroups)
-			if acct == nil && largeRotate {
+			if acct == nil && (rotateMode || budgetMode) {
 				// 所有号都在大请求窗口内：退化普通轮换，避免直接 503。
 				acct = h.cfg.Pool.PickExcludingForRealmGroups(tried, bareModel, realm, keyGroups)
 			}
-			if acct != nil && largeRotate {
-				h.noteLargeUse(acct.UID, time.Now())
-			}
+		}
+		// 粘性命中也消耗预算，否则同会话永远不会迁移。
+		if acct != nil && (rotateMode || budgetMode) {
+			h.noteLargeUse(acct.UID, time.Now())
 		}
 		if acct == nil {
 			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModelRealmGroups(bareModel, realm, keyGroups)) == 0 {
@@ -1295,7 +1324,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if stickyKey != "" && h.cfg.Session != nil && !largeRotate {
+		if stickyKey != "" && h.cfg.Session != nil && !rotateMode {
 			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {

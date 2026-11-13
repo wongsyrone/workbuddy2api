@@ -104,8 +104,10 @@
     "token": ""
   },
   "pool": {
-    "large_request_bytes": 262144,
+    "large_request_bytes": 2097152,
     "large_request_cooldown": "0s",
+    "large_request_budget": 6,
+    "large_request_budget_window": "120s",
     "max_in_flight": 3,
     "max_in_flight_global": 2,
     "breaker_threshold": 3,
