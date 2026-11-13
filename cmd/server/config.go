@@ -222,6 +222,7 @@ type Config struct {
 		// 0 = 默认 6，负数关闭预算；预算启用时优先于逐请求轮换。
 		LargeRequestBudget       int    `json:"large_request_budget"`
 		LargeRequestBudgetWindow string `json:"large_request_budget_window"`
+		CreditFloor              int64  `json:"credit_floor"`         // 0 = 关闭，低余额账号仍可作最后候选
 		MaxInFlight              int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal        int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
 		BreakerThreshold         int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
@@ -603,6 +604,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.LargeRequestBudget == 0 {
 		c.Pool.LargeRequestBudget = 6
+	}
+	if c.Pool.CreditFloor < 0 {
+		c.Pool.CreditFloor = 0
 	}
 	if c.Pool.LargeRequestBudgetWindow == "" {
 		c.Pool.LargeRequestBudgetWindow = "120s"

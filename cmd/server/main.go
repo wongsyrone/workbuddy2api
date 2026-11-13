@@ -388,6 +388,7 @@ func main() {
 		LargeRequestCooldown:     cfg.LargeRequestCooldownDur,
 		LargeRequestBudget:       cfg.Pool.LargeRequestBudget,
 		LargeRequestBudgetWindow: cfg.LargeRequestBudgetWindowDur,
+		CreditFloor:              cfg.Pool.CreditFloor,
 		PromptMode:               cfg.Prompt.Mode,
 		PromptText:               cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。

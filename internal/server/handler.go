@@ -49,6 +49,7 @@ type Config struct {
 	LargeRequestCooldown     time.Duration
 	LargeRequestBudget       int
 	LargeRequestBudgetWindow time.Duration
+	CreditFloor              int64
 	MaxRotate                int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -265,6 +266,9 @@ func (h *Handler) noteLargeUse(uid string, now time.Time) {
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
+	}
+	if cfg.Pool != nil {
+		cfg.Pool.SetCreditFloor(cfg.CreditFloor)
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）

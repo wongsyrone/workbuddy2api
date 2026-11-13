@@ -186,6 +186,7 @@ flowchart LR
 | `pool.large_request_bytes` | `2097152`（2 MiB） | 大请求策略阈值；设 `-1` 关闭整条策略。已有显式阈值保持不变。 |
 | `pool.large_request_budget` / `large_request_budget_window` | `6` / `"120s"` | 每账号滑动窗口内接满预算后，下一条大请求迁移会话；预算内保持粘性和账号级前缀缓存。`0` 回落默认预算，负数关闭预算；窗口须为正时长。全部候选用满时回落普通选号。 |
 | `pool.large_request_cooldown` | `"0s"` | 预算关闭且冷却为正（如 `"90s"`）时，沿用逐请求轮换，不写粘性绑定；预算启用时优先走预算。 |
+| `pool.credit_floor` | `0`（关闭） | 优先使用不低于保底积分的账号，粘性号跌破阈值也会让位；全部候选都低于阈值时仍可继续选号。余额未同步的账号不受排除，realm 与业务分组边界保持生效。 |
 | `schedule.account_delay_min_seconds` / `account_delay_max_seconds` | `0` / `0` | 定时任务账号之间额外随机等待，要求 `0 <= min <= max <= 600`。人工入口不叠加随机间隔；签到仍保留相邻账号至少 3 秒的基本间隔。 |
 | `schedule.random_delay_minutes` | `0` | 在原定小时内摊开任务，范围 `0..60`；启用后优先于既有 `jitter_minutes`，同一天重启保持稳定。 |
 | `cooldown.credit_exhausted` | `""` | 积分耗尽后的短冷却，例如 `"10m"`；空值沿用次日 04:00 恢复。兼容旧键 `pool.credit_exhausted`，同时配置时以非空的 `cooldown` 键为准。 |
