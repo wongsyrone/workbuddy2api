@@ -8,6 +8,7 @@ package upstream
 import (
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
@@ -25,8 +26,9 @@ var sanitizeFeatures = []string{
 }
 
 // sanitizeExtraFeatures 运行期从 config 追加的特征（features.sanitize_extra_features）。
-// 启动时一次性注入、之后只读，因此无需加锁；与 sanitizeFeatures 分开存放是为了可幂等
-// 重新配置（ConfigureSanitize 先清空再加，避免重复 append）。
+// sanitizeMu 保护两张可热重载词表，读侧取得不可变快照后释放锁。
+var sanitizeMu sync.RWMutex
+
 var sanitizeExtraFeatures []string
 
 // sanitizeExtraRewrites 运行期从 config 追加的逐字替换（features.sanitize_extra_rewrites）。
@@ -167,8 +169,11 @@ func sanitizeText(text string) string {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
 	// 运行期注入的额外逐字替换（features.sanitize_extra_rewrites）：让上游新增
-	// 黑名单词不必重编译镜像，改 config.json 重启即可。
-	for _, rw := range sanitizeExtraRewrites {
+	// 黑名单词不必重编译镜像，改 config.json 即可热重载。
+	sanitizeMu.RLock()
+	extraRewrites := sanitizeExtraRewrites
+	sanitizeMu.RUnlock()
+	for _, rw := range extraRewrites {
 		if rw[0] == "" || rw[0] == rw[1] {
 			continue
 		}
@@ -210,7 +215,10 @@ func hasFingerprint(text string) bool {
 		}
 	}
 	// 运行期注入的额外特征（features.sanitize_extra_features）：同样走小写兜底。
-	for _, f := range sanitizeExtraFeatures {
+	sanitizeMu.RLock()
+	extraFeatures := sanitizeExtraFeatures
+	sanitizeMu.RUnlock()
+	for _, f := range extraFeatures {
 		if f == "" {
 			continue
 		}
@@ -294,6 +302,42 @@ func sanitizeToolCalls(v any) bool {
 	return changed
 }
 
+// sanitizeTools 净化 tools[].function.description（issue #395）。
+//
+// 为什么需要：`sanitizeMessages` 只覆盖 messages，tools 数组原样出站；而
+// Claude Code / Codex 这类客户端的 tool description 与 system prompt 同源，
+// 都是固定模板句 —— 上游按逐字黑名单拦截，模板句正是高发区（#321/#308 的
+// 同类指纹）。这里对 description 做与正文相同的最小改写；**不改 name**：
+// 名字参与客户端/上游的工具匹配，改一个字符就会让调用对不上。
+//
+// 预检在 sanitizeText 内部（hasFingerprint），没命中时零分配返回原串。
+func sanitizeTools(v any) bool {
+	list, ok := v.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range list {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		desc, ok := fn["description"].(string)
+		if !ok {
+			continue
+		}
+		if s := sanitizeText(desc); s != desc {
+			fn["description"] = s
+			changed = true
+		}
+	}
+	return changed
+}
+
 // sanitizeMessages 净化 messages 中的 content、reasoning_content 与 tool_calls；任一命中返回 true。
 func sanitizeMessages(messages []any) bool {
 	changed := false
@@ -327,12 +371,12 @@ func sanitizeMessages(messages []any) bool {
 	return changed
 }
 
-// ConfigureSanitize 注入运行期额外词表（启动时调用一次，来自 config.json 的
+// ConfigureSanitize 整体替换运行期额外词表（启动与配置热重载时调用，来自 config.json 的
 // features.sanitize_extra_features / sanitize_extra_rewrites）。
 //
 // 为什么要有这个入口：上游的黑名单是**逐词扩充**的——2026-10-24 是 GUI 句、10-27
 // 变成 workspace root（CangShui/workbuddy-gateway#24 → #28），每次都得重编译镜像、
-// 重新部署才能跟上。把它做成配置项后，运维只需改 config.json 重启容器，不再等发版。
+// 重新部署才能跟上。配置热重载后只需修改 config.json，不再等发版。
 //
 // 幂等：每次都整体替换而不是 append，重复调用不会让同一词叠加多次。
 // 参数为空表示清空额外词表（回落到内置静态表）。
@@ -350,6 +394,15 @@ func ConfigureSanitize(extraFeatures []string, extraRewrites [][2]string) {
 		}
 		cleanRewrites = append(cleanRewrites, rw)
 	}
+	sanitizeMu.Lock()
 	sanitizeExtraFeatures = cleanFeatures
 	sanitizeExtraRewrites = cleanRewrites
+	sanitizeMu.Unlock()
+}
+
+// SanitizeExtraCounts 当前运行期词表的条数（供热重载日志与测试）。
+func SanitizeExtraCounts() (features, rewrites int) {
+	sanitizeMu.RLock()
+	defer sanitizeMu.RUnlock()
+	return len(sanitizeExtraFeatures), len(sanitizeExtraRewrites)
 }

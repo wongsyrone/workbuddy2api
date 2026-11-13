@@ -222,9 +222,15 @@ func main() {
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 	// 运行期追加的黑名单词表（features.sanitize_extra_features / _rewrites）：
-	// 上游逐词扩充黑名单时改 config.json 重启即可，不必重编译镜像。
+	// 上游逐词扩充黑名单时改 config.json 即可热重载，不必重编译镜像。
 	// 空表 = 只用内置静态表（行为与旧版一致）。
 	upstream.ConfigureSanitize(cfg.Features.SanitizeExtraFeatures, cfg.Features.SanitizeExtraRewrites)
+	// 配置变更时热重载词表（issue #396）：重启会断在途请求，而词表是整体替换语义。
+	if *cfgPath != "" {
+		stopSanitizeWatch := make(chan struct{})
+		defer close(stopSanitizeWatch)
+		go watchSanitizeConfig(*cfgPath, stopSanitizeWatch)
+	}
 	if n := len(cfg.Features.SanitizeExtraFeatures); n > 0 {
 		log.Printf("净化额外特征词表已加载：%d 条（config.json features.sanitize_extra_features）", n)
 	}

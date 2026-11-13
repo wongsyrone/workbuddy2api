@@ -190,7 +190,9 @@ flowchart LR
 | `schedule.account_delay_min_seconds` / `account_delay_max_seconds` | `0` / `0` | 定时任务账号之间额外随机等待，要求 `0 <= min <= max <= 600`。人工入口不叠加随机间隔；签到仍保留相邻账号至少 3 秒的基本间隔。 |
 | `schedule.random_delay_minutes` | `0` | 在原定小时内摊开任务，范围 `0..60`；启用后优先于既有 `jitter_minutes`，同一天重启保持稳定。 |
 | `cooldown.credit_exhausted` | `""` | 积分耗尽后的短冷却，例如 `"10m"`；空值沿用次日 04:00 恢复。兼容旧键 `pool.credit_exhausted`，同时配置时以非空的 `cooldown` 键为准。 |
-| `features.sanitize_extra_features` / `sanitize_extra_rewrites` | `[]` / `[]` | 追加净化预检词和 `[原文, 替换文本]` 规则；受既有净化总开关控制。 |
+| `features.sanitize_extra_features` / `sanitize_extra_rewrites` | `[]` / `[]` | 配置净化预检词和 `[原文, 替换文本]` 规则；约每 10 秒检测配置变更并整体替换，配置读取或校验失败时保留旧词表。受既有净化总开关控制，仅这两张词表支持热重载。 |
+
+净化同时覆盖消息和 `tools[].function.description`，不修改工具名称或参数 schema。
 
 账号文件顶层还支持 `weight` 乘数：未设置或 `0` 等价于 `1`，选号时钳制到 `0.1..100`，刷新凭证时保留该字段。粘性会话首绑与普通轮换都使用该权重。
 
