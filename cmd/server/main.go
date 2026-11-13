@@ -168,6 +168,10 @@ func main() {
 	p.SetCreditExhausted(cfg.CreditExhaustedDur)
 	upstream.ConfigureReasoningFallback(cfg.ReasoningAsContent == nil || *cfg.ReasoningAsContent)
 	upstream.ConfigureProxies(cfg.Proxies)
+	upstream.ConfigureHTTP2(cfg.Upstream.HTTP2)
+	if cfg.Upstream.HTTP2 {
+		log.Printf("出站 HTTP/2 已启用（upstream.http2=true）")
+	}
 	if names := upstream.RouteNames(); len(names) > 0 {
 		log.Printf("出口线路已加载：%s", strings.Join(names, ", "))
 	}

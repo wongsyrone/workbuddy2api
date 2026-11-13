@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,9 +69,16 @@ func newDialer() *net.Dialer {
 	}
 }
 
+var http2Enabled atomic.Bool
+
+// ConfigureHTTP2 在启动时设置后续 Transport 是否允许 ALPN 协商 HTTP/2。
+func ConfigureHTTP2(on bool) {
+	http2Enabled.Store(on)
+}
+
 // newTransport 构造共享出站 Transport（HTTP 与 ChatHTTP 同一实例，连接池不重复）。
 // 分两层防半死连接：
-//   - TLS 层：空 TLSNextProto 真正禁 h2（kongjianguan 二次修正的实证：ForceAttemptHTTP2=false
+//   - TLS 层：默认以空 TLSNextProto 禁 h2（kongjianguan 二次修正的实证：ForceAttemptHTTP2=false
 //     只对自定义 Dial 生效，默认 TLS 经 ALPN 仍协商出 h2，半死 h2 流复用表现为
 //     "http2: timeout awaiting response headers"——唯一正确写法是置空映射，让 ALPN
 //     完成后无 h2 协议可用，连接退回 HTTP/1.1）。
@@ -78,18 +86,21 @@ func newDialer() *net.Dialer {
 //     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
 func newTransport() *http.Transport {
 	dialer := newDialer()
-	return &http.Transport{
-		DialContext: dialer.DialContext,
-		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
-		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
-		// ForceAttemptHTTP2=false 后日志仍报 h2 timeout，正是这个陷阱）。
-		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	tr := &http.Transport{
+		DialContext:           dialer.DialContext,
 		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 		IdleConnTimeout:       idleConnTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
+	if http2Enabled.Load() {
+		tr.ForceAttemptHTTP2 = true
+	} else {
+		// 非 nil 空映射才会禁止标准库在 ALPN 后注入 HTTP/2。
+		tr.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	}
+	return tr
 }
 
 // DirectRouteName 是账号级「强制直连」的保留线路名（issue #223）。

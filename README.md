@@ -183,6 +183,7 @@ flowchart LR
 | `proxies` | `{}` | 线路名到 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理地址的映射。账号文件顶层 `proxy` 写线路名；`__direct__` 强制直连，空值沿用进程级代理。未知线路报错。 |
 | `reasoning_as_content` | `true` | 整轮既无正文、又无工具调用时，把 reasoning 同时作为正文输出；同时展示两个通道的客户端可能重复显示。可设 `false` 或 `WB2A_REASONING_AS_CONTENT=0` 关闭。 |
 | `upstream.gzip_body` | `true` | 对至少 64 KiB 的出站请求尝试 gzip；压缩无收益则保留原文，上游拒绝压缩或渠道校验失败时改用未压缩请求重试。 |
+| `upstream.http2` | `false` | 出站 HTTP/2 开关，也可用 `WB2A_HTTP2=true` 开启；通过标准库协商，默认保持 HTTP/1.1。开启前需验证部署网络中的 SSE 长流与代理兼容性。 |
 | `pool.large_request_bytes` | `2097152`（2 MiB） | 大请求策略阈值；设 `-1` 关闭整条策略。已有显式阈值保持不变。 |
 | `pool.large_request_budget` / `large_request_budget_window` | `6` / `"120s"` | 每账号滑动窗口内接满预算后，下一条大请求迁移会话；预算内保持粘性和账号级前缀缓存。`0` 回落默认预算，负数关闭预算；窗口须为正时长。全部候选用满时回落普通选号。 |
 | `pool.large_request_cooldown` | `"0s"` | 预算关闭且冷却为正（如 `"90s"`）时，沿用逐请求轮换，不写粘性绑定；预算启用时优先走预算。 |
