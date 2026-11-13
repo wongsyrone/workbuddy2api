@@ -11,7 +11,7 @@
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
 //	manualDisabled     ← setManualDisabledLocked（运维端点 / CLI；只置位不清其他维度）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
-//	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
+//	modelCooldowns     ← CooldownSoftForModel 有解析分支；到期清理或禁用时清空
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 喂入）；NoteSuccess 清
 //	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/reviveCoolingLocked 清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
@@ -20,8 +20,8 @@
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
 //     breakerUntil）正交：冷却管「近期被限流/余额耗尽」，熔断管「反复 5xx 失败」。
 //     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
-//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与
-//     reviveCoolingLocked（签到解冻）共用，二者对冷却域的处置因此永远一致。
+//   - clearCoolingLocked 清账号级冷却，保留活跃模型限流；disableLocked 额外清空
+//     模型限流，reviveCoolingLocked（签到解冻）则保留上游恢复时刻。
 //   - manualDisabled 与 disabled 各自独立：前者是运维意图（只能由运维入口清除），
 //     后者是系统判定（可被签到解冻/refresh 等路径自动撤销）。二者都不清对方，
 //     并存时 /status 分别透出（见 entry.go Status.manual_disabled/disabled 注释）。
@@ -29,15 +29,17 @@ package pool
 
 import "time"
 
-// clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
+// clearCoolingLocked 清冷却域：until/coolKind/softStreak 全归零，
 // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// 注意：活跃的模型级冷却（如 6004、11102）未到恢复时刻前仍有效，
+// 签到获得积分或解冻账号不得抹除上游真实模型的频率限制（仅惰性清理已过期条目）。
 // 调用方必须已持有 p.mu。
 func (e *entry) clearCoolingLocked() {
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+	e.pruneExpiredModelCooldowns(time.Now())
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
@@ -51,12 +53,13 @@ func (e *entry) clearCoolingLocked() {
 // 熔断观测仍有效，不应被禁用覆盖。
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
+	e.modelCooldowns = nil
 	e.disabled = true
 	e.reason = reason
 	p.dirty.Store(true)
 }
 
-// reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
+// reviveCoolingLocked 只清账号级冷却域（until/coolKind/reason/softStreak）
 // 并更新 credits，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
 // 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
 // 信号）不应被签到覆盖。
