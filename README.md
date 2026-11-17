@@ -339,6 +339,23 @@ curl -s http://localhost:7863/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
+### 联网搜索
+
+`POST /v1/tools/search` 使用与聊天相同的 API Key，支持 CN 和 global 账号，由客户端直接调用或通过搜索插件接入。搜索在当前密钥可见的业务分组内轮换账号，不使用会话粘性；上游地址随选中账号的 realm 切换。
+
+```bash
+curl -s http://localhost:7863/v1/tools/search \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Go generics tutorial","max_results":5,"allowed_domains":["go.dev"],"blocked_domains":["reddit.com"],"freshness":"y1"}'
+```
+
+`query` 必填；`type` 可省略或设为 `"text2text"`。`max_results` 默认 `5`，非正数回落默认，超过 `20` 时钳制为 `20`。`freshness` 可省略或设为 `"d1"`、`"m1"`、`"y1"`。`allowed_domains` 透传上游，`blocked_domains` 转成 `-site:` 查询条件，实际过滤效果由上游决定。请求体上限为 1 MiB；无效参数返回 400，超限返回 413。
+
+成功时返回上游的 `code`、`msg`、`results`、`total_results`、`response_time_ms`、`provider`。遇到搜索配额码 `15001`，账号进入固定 10 分钟的账号级软冷却并换号重试；这也会影响该账号的正常聊天选号。已尝试账号均耗尽搜索配额时返回 HTTP 429 和 `code: "quota_web_search"`，其他业务码保留 HTTP 200 与上游信封。没有可用账号时返回 503。
+
+本接口没有新增配置项，沿用现有鉴权、账号出口线路、在途限制和凭证续期。`config.example.json` 无需增加搜索专用设置。
+
 ## 贡献与 PR 要求
 
 **本仓库的 PR 由 AI 自动审核，并在通过闸门后自动合并。** 提交前请按下面的自查清单过一遍 ——

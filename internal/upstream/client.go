@@ -811,6 +811,11 @@ type Client struct {
 	ChatBaseCN    string
 	BillingBaseCN string
 
+	// AgentToolBaseOverride agenttool 域覆盖（0057 web search）。
+	// 空 = 按账号 realm 使用 www.workbuddy.cn / www.workbuddy.ai。
+	// 仅供测试注入，不暴露为用户配置。
+	AgentToolBaseOverride string
+
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
 	ChatBaseGlobal    string

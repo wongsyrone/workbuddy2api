@@ -295,6 +295,7 @@ func NewHandler(cfg Config) *Handler {
 		budget:      newDailyBudget(cfg.BudgetLimit),
 	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.toolSearch))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
